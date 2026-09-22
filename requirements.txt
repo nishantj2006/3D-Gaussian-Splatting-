@@ -1,7 +1,8 @@
 setuptools
+numpy==1.26.4
 plyfile
 pytorch-lightning==2.4.0
-opencv-python
+opencv-python==4.10.0.84
 imageio
 ftfy
 regex
@@ -23,3 +24,7 @@ scikit-learn
 pycocotools
 onnxruntime 
 onnx
+transformers==4.56.2
+ultralytics==8.3.204
+trimesh==4.8.3
+PyYAML==6.0.2

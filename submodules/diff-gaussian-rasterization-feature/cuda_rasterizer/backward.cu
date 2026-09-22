@@ -410,6 +410,7 @@ renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
+	int semantic_channels,
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
@@ -426,8 +427,7 @@ renderCUDA(
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
 	float* __restrict__ dL_dsemantic_feature,
-	float* __restrict__ dL_dz,
-	float* collected_semantic_feature) 
+	float* __restrict__ dL_dz)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -464,10 +464,7 @@ renderCUDA(
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
 
 	float accum_rec[C] = { 0 };
-	float accum_semantic_feature_rec[NUM_SEMANTIC_CHANNELS] = { 0 }; 
-
 	float dL_dpixel[C];
-	float dL_dfeaturepixel[NUM_SEMANTIC_CHANNELS];
 	float dL_depth;
 	float accum_depth_rec = 0;
 
@@ -479,13 +476,10 @@ renderCUDA(
 		
 		dL_depth = dL_depths[pix_id];
 
-		for (int i = 0; i < NUM_SEMANTIC_CHANNELS; i++) 
-			dL_dfeaturepixel[i] = dL_dfeaturepixels[i * H * W + pix_id];
 	}
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
-	float last_semantic_feature[NUM_SEMANTIC_CHANNELS] = { 0 };
 	float last_depth = 0; 
 
 	// Gradient of pixel coordinate w.r.t. normalized 
@@ -563,22 +557,14 @@ renderCUDA(
 			dL_dalpha += (c_d - accum_depth_rec) * dL_depth;
 
 
-			for (int ch = 0; ch < NUM_SEMANTIC_CHANNELS; ch++) 
+			for (int ch = 0; ch < semantic_channels; ch++)
 			{
-				const float f = collected_semantic_feature[ch * BLOCK_SIZE + j];
-				// Update last semantic feature (to be used in the next iteration)
-				accum_semantic_feature_rec[ch] = last_alpha * last_semantic_feature[ch] + (1.f - last_alpha) * accum_semantic_feature_rec[ch];
-				last_semantic_feature[ch] = f;
-
-				const float dL_dfeaturechannel = dL_dfeaturepixel[ch];
-				/**************************************************************************************************/
-				// dL_dalpha += (f - accum_semantic_feature_rec[ch]) * dL_dfeaturechannel; // Only works for semnatic-meaning feature. Disable this line for general features.
-				/**************************************************************************************************/
+				const float dL_dfeaturechannel = dL_dfeaturepixels[ch * H * W + pix_id];
 				
 				// Update the gradients w.r.t. semnatic feature of the Gaussian. 
 				// Atomic, since this pixel is just one of potentially
 				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dsemantic_feature[global_id * NUM_SEMANTIC_CHANNELS + ch]), dchannel_dsemantic_feature * dL_dfeaturechannel); 
+				atomicAdd(&(dL_dsemantic_feature[global_id * semantic_channels + ch]), dchannel_dsemantic_feature * dL_dfeaturechannel);
 			}			
 
 
@@ -693,6 +679,7 @@ void BACKWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H,
+	int semantic_channels,
 	const float* bg_color,
 	const float2* means2D,
 	const float4* conic_opacity,
@@ -709,14 +696,14 @@ void BACKWARD::render(
 	float* dL_dopacity,
 	float* dL_dcolors,
 	float* dL_dsemantic_feature,
-	float* dL_dz,
-	float* collected_semantic_feature) 
+	float* dL_dz)
 	
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
 		ranges,
 		point_list,
 		W, H,
+		semantic_channels,
 		bg_color,
 		means2D,
 		conic_opacity,
@@ -733,7 +720,6 @@ void BACKWARD::render(
 		dL_dopacity,
 		dL_dcolors,
 		dL_dsemantic_feature,
-		dL_dz,
-		collected_semantic_feature 
+		dL_dz
 		);
 }

@@ -8,13 +8,11 @@ from ultralytics import SAM
 from tqdm import tqdm
 from sklearn.decomposition import PCA
 import gc
+import pickle
+import argparse
 
-def extract_features():
+def extract_features(input_dir, output_dir, temp_dir, target_dim):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    input_dir = "data/my_scene/images/"  # Change this to your input directory containing images
-    output_dir = "output/feature_maps/"
-    temp_dir = "output/temp_512/"
     
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(temp_dir, exist_ok=True)
@@ -27,7 +25,10 @@ def extract_features():
     clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32", use_safetensors=True).to(device)
     clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
-    images = [f for f in os.listdir(input_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    images = sorted(
+        f for f in os.listdir(input_dir)
+        if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+    )
     if not images:
         print("No images found!")
         return
@@ -55,10 +56,12 @@ def extract_features():
         
         results = sam(cv2_img)
         
-        if results and len(results[0].masks) > 0:
+        if results and results[0].masks is not None and len(results[0].masks) > 0:
             masks = results[0].masks.data.cpu().numpy()
             boxes = results[0].boxes.xyxy.cpu().numpy() 
-            
+
+            object_crops = []
+            object_masks = []
             for i, mask in enumerate(masks):
                 if mask.shape != (h, w):
                     mask = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
@@ -70,22 +73,21 @@ def extract_features():
                 if area < 900: 
                     continue
                     
-                object_crop = pil_img.crop((x1, y1, x2, y2))
-                
-                inputs = clip_processor(images=object_crop, return_tensors="pt").to(device)
-                with torch.no_grad():
+                object_crops.append(pil_img.crop((x1, y1, x2, y2)))
+                small_mask = cv2.resize(mask.astype(np.uint8), (feat_w, feat_h), interpolation=cv2.INTER_NEAREST)
+                object_masks.append(torch.from_numpy(small_mask.astype(bool)))
+
+            if object_crops:
+                inputs = clip_processor(
+                    images=object_crops, return_tensors="pt", padding=True
+                ).to(device)
+                with torch.inference_mode():
                     clip_features = clip_model.get_image_features(**inputs)
                     clip_features /= clip_features.norm(dim=-1, keepdim=True)
-                    clip_features = clip_features.squeeze(0).half().cpu() 
-                
-                # FORCE the mask to shrink to the exact size of the small feature map
-                small_mask = cv2.resize(mask.astype(np.uint8), (feat_w, feat_h), interpolation=cv2.INTER_NEAREST)
-                
-                mask_tensor = torch.tensor(small_mask, dtype=torch.bool, device="cpu")
-                feature_map[mask_tensor] = clip_features
-                
-                # Save just this 512D object vector to CPU RAM for Phase 2
-                all_unique_features.append(clip_features.cpu().numpy())
+                    clip_features = clip_features.half().cpu()
+                for mask_tensor, clip_feature in zip(object_masks, clip_features):
+                    feature_map[mask_tensor] = clip_feature
+                    all_unique_features.append(clip_feature.numpy())
                 
         # Save the heavy 512D map to disk temporarily so we don't run out of RAM
         temp_save_path = os.path.join(temp_dir, f"{img_name.split('.')[0]}_features.pt")
@@ -113,18 +115,27 @@ def extract_features():
     # Stack all unique object vectors into a single matrix (N_objects, 512)
     all_unique_features = np.vstack(all_unique_features).astype(np.float32)
     
-    pca = PCA(n_components=16)
+    if len(all_unique_features) < target_dim:
+        raise ValueError(
+            f"PCA needs at least {target_dim} object samples, got {len(all_unique_features)}"
+        )
+    pca = PCA(n_components=target_dim)
     pca.fit(all_unique_features)
+    pca_path = os.path.join(
+        os.path.dirname(output_dir.rstrip(os.sep)), f"pca_model_{target_dim}.pkl"
+    )
+    with open(pca_path, "wb") as pca_file:
+        pickle.dump(pca, pca_file)
 
     # ==========================================
     # PHASE 3: Apply PCA to spatial maps & Save
     # ==========================================
-    print("\nPhase 3: Compressing feature maps to 128D...")
+    print(f"\nPhase 3: Compressing feature maps to {target_dim}D...")
     
     for img_name in tqdm(images):
         base_name = img_name.split('.')[0]
-        temp_path = os.path.join(temp_dir, f"{base_name}.pt")
-        final_path = os.path.join(output_dir, f"{base_name}.pt")
+        temp_path = os.path.join(temp_dir, f"{base_name}_features.pt")
+        final_path = os.path.join(output_dir, f"{base_name}_fmap_CxHxW.pt")
         
         if not os.path.exists(temp_path):
             continue
@@ -140,7 +151,9 @@ def extract_features():
         compressed_flat = pca.transform(flat_map)
         
         # Reshape back to spatial map and convert back to Float16 tensor
-        feat_map_128 = torch.from_numpy(compressed_flat.reshape((h, w, 128))).half()
+        feat_map_128 = torch.from_numpy(
+            compressed_flat.reshape((h, w, target_dim))
+        ).permute(2, 0, 1).contiguous().half()
         
         # Save the final 128D PyTorch tensor!
         torch.save(feat_map_128, final_path)
@@ -156,7 +169,13 @@ def extract_features():
     except OSError:
         pass
 
-    print("\nExtraction complete! 128D Feature maps saved successfully.")
+    print(f"\nExtraction complete! {target_dim}D Feature maps saved successfully.")
 
 if __name__ == "__main__":
-    extract_features()
+    parser = argparse.ArgumentParser(description="Generate dense SAM+CLIP feature maps")
+    parser.add_argument("--input-dir", default="data/my_scene/images")
+    parser.add_argument("--output-dir", default="data/my_scene/sam_embeddings_128")
+    parser.add_argument("--temp-dir", default="output/temp_512_128")
+    parser.add_argument("--target-dim", type=int, default=128)
+    args = parser.parse_args()
+    extract_features(args.input_dir, args.output_dir, args.temp_dir, args.target_dim)

@@ -48,14 +48,18 @@ class ModelParams(ParamGroup):
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
         self._source_path = ""
-        self._foundation_model = "" ###
+        self._foundation_model = "sam" ###
         self._model_path = ""
         self._images = "images"
-        self._resolution = -1
+        # AGX Orin 64 GB profile: retain the source image resolution.
+        self._resolution = 1
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
         self.speedup = False ###
+        self.semantic_feature_dim = 128
+        self.semantic_feature_dir = "sam_embeddings_128"
+        self.feature_cache = "cuda"
         self.render_items = ['RGB', 'Depth', 'Edge', 'Normal', 'Curvature', 'Feature Map']
         super().__init__(parser, "Loading Parameters", sentinel)
 
@@ -73,25 +77,32 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
-        self.iterations = 30_000
+        # 64 GB AGX Orin profile: allow a longer optimization and
+        # densification phase while retaining a safe 128D descriptor.
+        self.iterations = 40_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
-        self.position_lr_max_steps = 30_000
+        self.position_lr_max_steps = 40_000
         self.feature_lr = 0.0025
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
 #################################################
         self.semantic_feature_lr = 0.001 
+        self.feature_loss_weight = 1.0
 #################################################
-        self.percent_dense = 0.01
+        # Four simultaneous views use the Orin's 64 GB unified memory for a
+        # stronger multi-view gradient. Reduce to 2 if telemetry approaches
+        # the 55 GiB safety ceiling.
+        self.batch_size = 4
+        self.percent_dense = 0.02
         self.lambda_dssim = 0.2
         self.densification_interval = 100
         self.opacity_reset_interval = 3000 ### TRY reset to 100000 but worse
         self.densify_from_iter = 500
-        self.densify_until_iter = 15_000 #6000 ### comapre with 2-stage
-        self.densify_grad_threshold = 0.0002
+        self.densify_until_iter = 25_000
+        self.densify_grad_threshold = 0.0001
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

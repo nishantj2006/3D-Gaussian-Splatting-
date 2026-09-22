@@ -41,7 +41,7 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree : int):
+    def __init__(self, sh_degree : int, semantic_feature_dim: int = 128):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
@@ -57,6 +57,9 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+        if not 1 <= semantic_feature_dim <= 128:
+            raise ValueError("semantic_feature_dim must be between 1 and 128")
+        self.semantic_feature_dim = semantic_feature_dim
         self._semantic_feature = torch.empty(0) 
 
     def capture(self):
@@ -139,9 +142,13 @@ class GaussianModel:
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
         
+        if semantic_feature_size != self.semantic_feature_dim:
+            raise ValueError(
+                f"Dataset has {semantic_feature_size}D features, but --semantic_feature_dim "
+                f"is {self.semantic_feature_dim}. Regenerate/compress features to the requested size."
+            )
         if speedup: # speed up for Segmentation
-            semantic_feature_size = int(semantic_feature_size/4)
-        semantic_feature_size = 64
+            semantic_feature_size = max(1, int(semantic_feature_size/4))
         self._semantic_feature = torch.zeros(fused_point_cloud.shape[0], semantic_feature_size, 1).float().cuda() 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
@@ -163,7 +170,11 @@ class GaussianModel:
         
 
     def training_setup(self, training_args):
-        self._semantic_feature = torch.zeros((self.get_xyz.shape[0], 1, 64), dtype=torch.float, device="cuda").requires_grad_(True)
+        if self._semantic_feature.numel() == 0:
+            self._semantic_feature = torch.zeros(
+                (self.get_xyz.shape[0], 1, self.semantic_feature_dim), dtype=torch.float, device="cuda"
+            )
+        self._semantic_feature = nn.Parameter(self._semantic_feature.detach().requires_grad_(True))
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")

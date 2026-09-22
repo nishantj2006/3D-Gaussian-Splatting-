@@ -264,6 +264,7 @@ renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
+	int semantic_channels,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float* __restrict__ semantics,
@@ -306,7 +307,7 @@ renderCUDA(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
-	float SF[NUM_SEMANTIC_CHANNELS] = { 0 };
+	float SF[MAX_SEMANTIC_CHANNELS] = { 0 };
 	float D = { 0 };
 
 	// Iterate over batches until all done or range is complete
@@ -367,8 +368,8 @@ renderCUDA(
 			float w = alpha*T;
 			D += depp*w;
 			
-			for (int ch = 0; ch < NUM_SEMANTIC_CHANNELS; ch++){
-				SF[ch] += semantics[collected_id[j] * NUM_SEMANTIC_CHANNELS + ch] * alpha * T; 
+			for (int ch = 0; ch < semantic_channels; ch++){
+				SF[ch] += semantics[collected_id[j] * semantic_channels + ch] * alpha * T;
 			}
 
 			T = test_T;
@@ -390,7 +391,7 @@ renderCUDA(
 		// depth
 		out_depth[pix_id] = D;
 		// feature
-		for (int ch = 0; ch < NUM_SEMANTIC_CHANNELS; ch++)                 
+		for (int ch = 0; ch < semantic_channels; ch++)
 			out_feature_map[ch * H * W + pix_id] = SF[ch];
 	}
 }
@@ -400,6 +401,7 @@ void FORWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H,
+	int semantic_channels,
 	const float2* means2D,
 	const float* colors,
 	const float* semantic_feature,
@@ -416,6 +418,7 @@ void FORWARD::render(
 		ranges,
 		point_list,
 		W, H,
+		semantic_channels,
 		means2D,
 		colors,
 		semantic_feature,

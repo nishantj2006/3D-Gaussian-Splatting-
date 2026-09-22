@@ -7,7 +7,9 @@ from utils.image_utils import render_net_image
 import torch
 
 def view(dataset, pipe, iteration):
-    gaussians = GaussianModel(dataset.sh_degree)
+    gaussians = GaussianModel(
+        dataset.sh_degree, getattr(dataset, "semantic_feature_dim", 128)
+    )
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")

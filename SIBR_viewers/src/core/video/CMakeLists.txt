@@ -13,6 +13,12 @@ project(sibr_video)
 file(GLOB SOURCES "*.cpp" "*.h" "*.hpp")
 source_group("Source Files" FILES ${SOURCES})
 
+# The remote Gaussian viewer only needs FFmpegVideoEncoder for optional capture
+# export. VideoUtils additionally requires OpenCV contrib's optical-flow and
+# edge-filter modules, which are not shipped with Jetson's NVIDIA OpenCV build.
+# Excluding that unrelated utility keeps the interactive viewer build portable.
+list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/VideoUtils.cpp")
+
 
 ## Specify target rules
 add_library(${PROJECT_NAME} SHARED ${SOURCES})

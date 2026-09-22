@@ -14,6 +14,10 @@ from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
 os.path.dirname(os.path.abspath(__file__))
 
+# Jetson AGX Orin uses Ampere compute capability 8.7. Users can override this
+# environment variable before invoking pip when building for another GPU.
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.7")
+
 setup(
     name="diff_gaussian_rasterization",
     packages=['diff_gaussian_rasterization'],

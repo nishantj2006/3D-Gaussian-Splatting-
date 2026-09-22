@@ -10,8 +10,8 @@ def compress_features():
     temp_dir = "output/perm512/"
     output_dir = "output/feature_maps/"
     
-    # Keeping this at 16 for your 6GB GPU
-    target_dim = 64 
+    # Jetson AGX Orin profile: retain a richer descriptor per Gaussian.
+    target_dim = 128
     
     os.makedirs(output_dir, exist_ok=True)
 
@@ -58,7 +58,7 @@ def compress_features():
     for f in tqdm(pt_files, desc="Compressing"):
         pt_path = os.path.join(temp_dir, f)
         
-        clean_name = f.replace('_features.pt', '.pt')
+        clean_name = f.replace('_features.pt', '_fmap_CxHxW.pt')
         final_path = os.path.join(output_dir, clean_name)
         
         feat_map_512 = torch.load(pt_path).numpy()
@@ -67,13 +67,15 @@ def compress_features():
         flat_map = feat_map_512.reshape(-1, 512).astype(np.float32)
         compressed_flat = pca.transform(flat_map)
         
-        feat_map_compressed = torch.from_numpy(compressed_flat.reshape((h, w, target_dim))).half()
+        feat_map_compressed = torch.from_numpy(
+            compressed_flat.reshape((h, w, target_dim))
+        ).permute(2, 0, 1).contiguous().half()
         torch.save(feat_map_compressed, final_path)
         
         del feat_map_512, flat_map, compressed_flat, feat_map_compressed
         gc.collect()
 
-    print("\nCompression complete! 16D Feature maps and pca_model.pkl saved.")
+    print(f"\nCompression complete! {target_dim}D feature maps and pca_model.pkl saved.")
 
 if __name__ == "__main__":
     compress_features()

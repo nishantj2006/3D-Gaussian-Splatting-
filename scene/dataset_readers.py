@@ -23,6 +23,7 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 import torch
+from utils.feature_utils import feature_channels
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -145,7 +146,8 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, foundation_model, images, eval, llffhold=8):
+def readColmapSceneInfo(path, foundation_model, images, eval,
+                        semantic_feature_dir_override="", llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -159,7 +161,9 @@ def readColmapSceneInfo(path, foundation_model, images, eval, llffhold=8):
     
     reading_dir = "images" if images == None else images
 
-    if foundation_model =='sam':
+    if semantic_feature_dir_override:
+        semantic_feature_dir = semantic_feature_dir_override
+    elif foundation_model =='sam':
         semantic_feature_dir = "sam_embeddings" 
     elif foundation_model =='lseg':
         semantic_feature_dir = "rgb_feature_langseg" 
@@ -175,10 +179,10 @@ def readColmapSceneInfo(path, foundation_model, images, eval, llffhold=8):
     if isinstance(cam_infos[0].semantic_feature, str):
         # Just load the first one briefly to get the dimension, then let it go
         temp_feat = torch.load(cam_infos[0].semantic_feature, map_location="cpu")
-        semantic_feature_dim = temp_feat.shape[-1] # Use -1 if shape is (H,W,C) or 0 if (C,H,W)
+        semantic_feature_dim = feature_channels(temp_feat.shape)
         del temp_feat
     else:
-        semantic_feature_dim = cam_infos[0].semantic_feature.shape[0]
+        semantic_feature_dim = feature_channels(cam_infos[0].semantic_feature.shape)
 
     if eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 2] # avoid 1st to be test view
@@ -263,8 +267,11 @@ def readCamerasFromTransforms(path, transformsfile, white_background, semantic_f
             
     return cam_infos
 
-def readNerfSyntheticInfo(path, foundation_model, white_background, eval, extension=".png"): 
-    if foundation_model =='sam':
+def readNerfSyntheticInfo(path, foundation_model, white_background, eval,
+                          extension=".png", semantic_feature_dir_override=""):
+    if semantic_feature_dir_override:
+        semantic_feature_dir = semantic_feature_dir_override
+    elif foundation_model =='sam':
         semantic_feature_dir = "sam_embeddings" 
     elif foundation_model =='lseg':
         semantic_feature_dir = "rgb_feature_langseg" 
@@ -299,10 +306,10 @@ def readNerfSyntheticInfo(path, foundation_model, white_background, eval, extens
     # Peek at the first file to get the dimension without keeping it in memory
     if isinstance(train_cam_infos[0].semantic_feature, str):
         temp_feat = torch.load(train_cam_infos[0].semantic_feature, map_location="cpu")
-        semantic_feature_dim = temp_feat.shape[0] # Adjust index to -1 if your shape is H,W,C
+        semantic_feature_dim = feature_channels(temp_feat.shape)
         del temp_feat
     else:
-        semantic_feature_dim = train_cam_infos[0].semantic_feature.shape[0]
+        semantic_feature_dim = feature_channels(train_cam_infos[0].semantic_feature.shape)
         
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

@@ -1,49 +1,54 @@
-import torch
-from scene.gaussian_model import GaussianModel
+"""Transform and merge a generated Gaussian asset into a trained scene."""
 
-# --- CONFIGURATION ---
-room_path = "output/semantic_run_64D/point_cloud/iteration_20000/cleaned_cloud.ply"
-# Make sure this points to the output from your bridge script!
-new_object_path = "cat_gaussians.ply" 
-output_path = "output/semantic_run_64D/point_cloud/iteration_20000/room_with_cat.ply"
+import argparse
+import math
+from pathlib import Path
+import numpy as np
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+from utils.ply_semantic_utils import (
+    add_float_property, align_dtype, read_object_manifest, read_vertices,
+    write_object_manifest, write_vertices,
+)
 
-def inject_new_object():
-    print("Loading your room...")
-    room = GaussianModel(sh_degree=1)
-    room.load_ply(room_path)
-    
-    print("Loading the new AI-generated object...")
-    new_obj = GaussianModel(sh_degree=1) # Match the SH degree of your room!
-    new_obj.load_ply(new_object_path)
 
-    # --- POSITION AND SCALE THE NEW OBJECT ---
-    scale_factor = 0.5 
-    new_obj._xyz *= scale_factor
-    new_obj._scaling -= abs(torch.log(torch.tensor(scale_factor))) 
-    
-    # Move it to where you want it in the room (X, Y, Z)
-    new_obj._xyz[:, 0] += 1.5 
-    new_obj._xyz[:, 1] += 0.0 
-    new_obj._xyz[:, 2] += -2.0 
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scene", required=True)
+    parser.add_argument("--asset", required=True)
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--scale", type=float, default=1.0)
+    parser.add_argument("--translate", type=float, nargs=3, metavar=("X", "Y", "Z"), default=(0, 0, 0))
+    parser.add_argument("--object-id", type=int, required=True)
+    parser.add_argument("--label", required=True)
+    return parser.parse_args()
 
-    # --- THE MERGE ---
-    print("Gluing the objects together...")
-    with torch.no_grad():
-        room._xyz = torch.cat([room._xyz, new_obj._xyz], dim=0)
-        room._features_dc = torch.cat([room._features_dc, new_obj._features_dc], dim=0)
-        room._features_rest = torch.cat([room._features_rest, new_obj._features_rest], dim=0)
-        room._opacity = torch.cat([room._opacity, new_obj._opacity], dim=0)
-        room._scaling = torch.cat([room._scaling, new_obj._scaling], dim=0)
-        room._rotation = torch.cat([room._rotation, new_obj._rotation], dim=0)
-        
-        # Merge the 64D semantics we already created in bridge.py!
-        if hasattr(room, '_semantic_feature') and hasattr(new_obj, '_semantic_feature'):
-            room._semantic_feature = torch.cat([room._semantic_feature, new_obj._semantic_feature], dim=0)
 
-    room.save_ply(output_path)
-    print(f"Done! Open {output_path} to see your newly generated object in the room.")
+def merge(args):
+    if args.scale <= 0:
+        raise ValueError("--scale must be positive")
+    scene_ply, scene = read_vertices(args.scene)
+    _, asset = read_vertices(args.asset)
+    scene = add_float_property(scene, "object_id", 0.0)
+    asset = add_float_property(asset, "object_id", float(args.object_id))
+    asset = align_dtype(asset, scene.dtype)
+    for field, offset in zip(("x", "y", "z"), args.translate):
+        asset[field] = asset[field] * args.scale + offset
+    for field in (name for name in asset.dtype.names if name.startswith("scale_")):
+        asset[field] += math.log(args.scale)
+
+    merged = np.concatenate((scene, asset))
+    write_vertices(args.output, merged, scene_ply, [f"object {args.object_id}: {args.label}"])
+    manifest = read_object_manifest(args.scene)
+    manifest.setdefault("objects", {})[str(args.object_id)] = {
+        "label": args.label,
+        "source": str(Path(args.asset).resolve()),
+        "point_count": int(len(asset)),
+    }
+    manifest["background_object_id"] = 0
+    manifest_path = write_object_manifest(args.output, manifest)
+    print(f"Merged {len(asset):,} asset points with {len(scene):,} scene points -> {args.output}")
+    print(f"Object manifest: {manifest_path}")
+
 
 if __name__ == "__main__":
-    inject_new_object()
+    merge(parse_args())

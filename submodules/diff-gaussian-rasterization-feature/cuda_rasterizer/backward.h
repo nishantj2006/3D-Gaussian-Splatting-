@@ -25,6 +25,7 @@ namespace BACKWARD
 		const uint2* ranges,
 		const uint32_t* point_list,
 		int W, int H,
+		int semantic_channels,
 		const float* bg_color,
 		const float2* means2D,
 		const float4* conic_opacity,
@@ -41,8 +42,7 @@ namespace BACKWARD
 		float* dL_dopacity,
 		float* dL_dcolors,
 		float* dL_dsemantic_feature,
-		float* dL_dz,
-		float* collected_semantic_feature 
+		float* dL_dz
 		);
 
 	void preprocess(

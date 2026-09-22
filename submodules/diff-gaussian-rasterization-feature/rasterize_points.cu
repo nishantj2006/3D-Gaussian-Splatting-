@@ -61,6 +61,13 @@ RasterizeGaussiansCUDA(
   const int P = means3D.size(0);
   const int H = image_height;
   const int W = image_width;
+  if (semantic_feature.ndimension() != 3 || semantic_feature.size(0) != P || semantic_feature.size(1) != 1) {
+    AT_ERROR("semantic_feature must have dimensions (num_points, 1, channels)");
+  }
+  const int semantic_channels = semantic_feature.size(2);
+  if (semantic_channels < 1 || semantic_channels > MAX_SEMANTIC_CHANNELS) {
+    AT_ERROR("semantic feature channels must be in [1, ", MAX_SEMANTIC_CHANNELS, "]");
+  }
 
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
@@ -70,7 +77,7 @@ RasterizeGaussiansCUDA(
 
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
 
-  torch::Tensor out_feature_map = torch::full({NUM_SEMANTIC_CHANNELS, H, W}, 0.0, float_opts); /***/
+  torch::Tensor out_feature_map = torch::full({semantic_channels, H, W}, 0.0, float_opts); /***/
   
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
@@ -112,6 +119,7 @@ RasterizeGaussiansCUDA(
 		tan_fovx,
 		tan_fovy,
 		prefiltered,
+		semantic_channels,
 		out_color.contiguous().data<float>(),
 		out_feature_map.contiguous().data<float>(), /***/
 		out_depth.contiguous().data<float>(),
@@ -153,6 +161,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   const int P = means3D.size(0);
   const int H = dL_dout_color.size(1);
   const int W = dL_dout_color.size(2);
+  const int semantic_channels = semantic_feature.size(2);
 
   int M = 0;
   if(sh.size(0) != 0)
@@ -163,7 +172,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
   torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, means3D.options());
-  torch::Tensor dL_dsemantic_feature = torch::zeros({P, semantic_feature.size(1), NUM_SEMANTIC_CHANNELS}, means3D.options()); /***/ 
+  torch::Tensor dL_dsemantic_feature = torch::zeros_like(semantic_feature); /***/
   torch::Tensor dL_dconic = torch::zeros({P, 2, 2}, means3D.options());
   torch::Tensor dL_dopacity = torch::zeros({P, 1}, means3D.options());
   torch::Tensor dL_dcov3D = torch::zeros({P, 6}, means3D.options());
@@ -197,6 +206,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  dL_dout_color.contiguous().data<float>(),
 	  dL_dout_feature.contiguous().data<float>(), /***************************/
 	  dL_dout_depth.contiguous().data<float>(),
+	  semantic_channels,
 	  dL_dmeans2D.contiguous().data<float>(),
 	  dL_dconic.contiguous().data<float>(),  
 	  dL_dopacity.contiguous().data<float>(),

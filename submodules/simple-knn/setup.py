@@ -13,6 +13,9 @@ from setuptools import setup
 from torch.utils.cpp_extension import CUDAExtension, BuildExtension
 import os
 
+# Jetson AGX Orin native CUDA target; externally supplied values take priority.
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.7")
+
 cxx_compiler_flags = []
 
 if os.name == 'nt':

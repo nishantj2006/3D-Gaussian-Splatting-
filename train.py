@@ -32,35 +32,59 @@ import torch.nn.functional as F
 from models.networks import CNN_decoder
 from models.semantic_dataloader import VariableSizeDataset
 from torch.utils.data import DataLoader
+from utils.feature_utils import FeatureMapCache, load_feature_map
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree)
+    gaussians = GaussianModel(dataset.sh_degree, dataset.semantic_feature_dim)
     scene = Scene(dataset, gaussians)
+
+    feature_cache = None
+    if dataset.feature_cache.lower() not in ("", "none", "off"):
+        feature_cache = FeatureMapCache(
+            device=dataset.feature_cache,
+            expected_channels=dataset.semantic_feature_dim,
+        )
+        cache_cameras = scene.getTrainCameras() + scene.getTestCameras()
+        for camera in tqdm(cache_cameras, desc="Caching semantic feature maps"):
+            feature_cache.get(camera.semantic_feature)
+        cache_gib = sum(
+            feature.numel() * feature.element_size()
+            for feature in feature_cache._maps.values()
+        ) / (1024 ** 3)
+        print(
+            f"Cached {len(feature_cache)} semantic maps on {dataset.feature_cache} "
+            f"({cache_gib:.2f} GiB tensor data)"
+        )
+
+    def get_gt_feature(source):
+        if feature_cache is not None:
+            return feature_cache.get(source)
+        return load_feature_map(
+            source, expected_channels=dataset.semantic_feature_dim
+        )
 
     # 2D semantic feature map CNN decoder
     viewpoint_stack = scene.getTrainCameras().copy()
     viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
     # Check if we have a path string or a pre-loaded tensor
-    if isinstance(viewpoint_cam.semantic_feature, str):
-        # Load the .pt file and move it to the GPU immediately
-        gt_feature_map = torch.load(viewpoint_cam.semantic_feature).cuda()
-    else:
-        gt_feature_map = viewpoint_cam.semantic_feature.cuda()
+    gt_feature_map = get_gt_feature(viewpoint_cam.semantic_feature)
     feature_out_dim = gt_feature_map.shape[0]
 
     
     # speed up
     if dataset.speedup:
-        feature_in_dim = 64
+        feature_in_dim = gaussians.get_semantic_feature.shape[-1]
         cnn_decoder = CNN_decoder(feature_in_dim, feature_out_dim)
         cnn_decoder_optimizer = torch.optim.Adam(cnn_decoder.parameters(), lr=0.0001)
 
 
     gaussians.training_setup(opt)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        # Checkpoints are generated locally by this training script and include
+        # optimizer state, so use PyTorch's legacy full-state loader for resume.
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -87,54 +111,61 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         if iteration % 100 == 0:
             print(f"Iteration {iteration} | Current Point Count: {gaussians.get_xyz.shape[0]}")
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        # Hold all view graphs until one averaged backward pass.  This uses the
+        # Orin's memory headroom and produces a true multi-view gradient batch.
+        viewpoint_cams = []
+        for _ in range(max(1, opt.batch_size)):
+            if not viewpoint_stack:
+                viewpoint_stack = scene.getTrainCameras().copy()
+            viewpoint_cams.append(
+                viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+            )
 
-        # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-        
 
-        feature_map, image, viewspace_point_tensor, visibility_filter, radii = render_pkg["feature_map"], render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        
+        batch_packages = []
+        batch_losses = []
+        batch_l1 = []
+        batch_feature_l1 = []
+        for viewpoint_cam in viewpoint_cams:
+            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+            feature_map = render_pkg["feature_map"]
+            image = render_pkg["render"]
 
-        # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        # Lazy load the feature map for this specific camera during the loop
-        if isinstance(viewpoint_cam.semantic_feature, str):
-            gt_feature_map = torch.load(viewpoint_cam.semantic_feature).cuda()
-        else:
-            gt_feature_map = viewpoint_cam.semantic_feature.cuda()
-        feature_map = F.interpolate(feature_map.unsqueeze(0), size=(gt_feature_map.shape[1], gt_feature_map.shape[2]), mode='bilinear', align_corners=True).squeeze(0) 
-        if dataset.speedup:
-            feature_map = cnn_decoder(feature_map)
-        # --- FEATURE PREP BLOCK ---
-        # 1. Lazy load the feature map for this specific camera
-        if isinstance(viewpoint_cam.semantic_feature, str):
-            gt_feature_map = torch.load(viewpoint_cam.semantic_feature).cuda()
-        else:
-            gt_feature_map = viewpoint_cam.semantic_feature.cuda()
-            
-        # 2. Fix Channels: Permute to [Channels, Height, Width]
-        # if len(gt_feature_map.shape) == 3 and gt_feature_map.shape[-1] == 64:
-        #     gt_feature_map = gt_feature_map.permute(2, 0, 1)
-            
-        # 3. Fix Resolution: Upscale to match the current render
-        if gt_feature_map.shape[1:] != feature_map.shape[1:]:
-            gt_feature_map = F.interpolate(
-                gt_feature_map.unsqueeze(0).float(), 
-                size=(feature_map.shape[1], feature_map.shape[2]), 
-                mode='bilinear', 
-                align_corners=False
-            ).squeeze(0).type_as(feature_map)
-            
-        # 4. Finally, calculate the loss!
-        Ll1_feature = l1_loss(feature_map, gt_feature_map) 
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + 1.0 * Ll1_feature 
+            gt_image = viewpoint_cam.original_image
+            Ll1_view = l1_loss(image, gt_image)
+            gt_feature_map = get_gt_feature(viewpoint_cam.semantic_feature)
+            feature_map = F.interpolate(
+                feature_map.unsqueeze(0),
+                size=gt_feature_map.shape[1:],
+                mode='bilinear',
+                align_corners=True,
+            ).squeeze(0)
+            if dataset.speedup:
+                feature_map = cnn_decoder(feature_map)
+            if gt_feature_map.shape[1:] != feature_map.shape[1:]:
+                gt_feature_map = F.interpolate(
+                    gt_feature_map.unsqueeze(0).float(),
+                    size=feature_map.shape[1:],
+                    mode='bilinear',
+                    align_corners=False,
+                ).squeeze(0).type_as(feature_map)
+
+            Ll1_feature_view = l1_loss(feature_map, gt_feature_map)
+            view_loss = (
+                (1.0 - opt.lambda_dssim) * Ll1_view
+                + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+                + opt.feature_loss_weight * Ll1_feature_view
+            )
+            batch_packages.append(render_pkg)
+            batch_losses.append(view_loss)
+            batch_l1.append(Ll1_view)
+            batch_feature_l1.append(Ll1_feature_view)
+
+        loss = torch.stack(batch_losses).mean()
+        Ll1 = torch.stack(batch_l1).mean()
+        Ll1_feature = torch.stack(batch_feature_l1).mean()
 
         loss.backward()
         iter_end.record()
@@ -160,9 +191,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             # Densification
             if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                for batch_pkg in batch_packages:
+                    viewspace_point_tensor = batch_pkg["viewspace_points"]
+                    visibility_filter = batch_pkg["visibility_filter"]
+                    radii = batch_pkg["radii"]
+                    gaussians.max_radii2D[visibility_filter] = torch.max(
+                        gaussians.max_radii2D[visibility_filter], radii[visibility_filter]
+                    )
+                    gaussians.add_densification_stats(
+                        viewspace_point_tensor, visibility_filter
+                    )
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -179,9 +217,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if dataset.speedup:
                     cnn_decoder_optimizer.step()
                     cnn_decoder_optimizer.zero_grad(set_to_none = True)
-            # FREE VRAM: Delete the feature map and clear cache
-            del gt_feature_map
-            del feature_map
+            del batch_packages, batch_losses, batch_l1, batch_feature_l1
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
@@ -283,8 +319,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 20_000, 40_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 20_000, 40_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)

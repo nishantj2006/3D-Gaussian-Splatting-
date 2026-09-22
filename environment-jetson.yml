@@ -1,0 +1,14 @@
+name: gaussian-orin
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip=25
+  - setuptools=75
+  - wheel=0.45
+  - numpy=1.26.4
+  - cmake
+  - ninja
+  - pip:
+      # Install the Jetson CUDA PyTorch/torchvision wheels before this list.
+      - -r requirements.txt

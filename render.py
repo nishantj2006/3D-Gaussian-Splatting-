@@ -30,9 +30,10 @@ import numpy as np
 from PIL import Image
 import torch.nn as nn
 import torch.nn.functional as F
-from utils.clip_utils import CLIPEditor
 import yaml
 from models.networks import CNN_decoder, MLP_encoder
+from utils.feature_utils import load_feature_map
+from utils.semantic_utils import encode_text, load_pca
 
 
 def feature_visualize_saving(feature):
@@ -53,7 +54,7 @@ def feature_visualize_saving(feature):
     return vis_feature
 
 
-def parse_edit_config_and_text_encoding(edit_config):
+def parse_edit_config_and_text_encoding(edit_config, feature_dim):
     edit_dict = {}
     if edit_config is not None:
         with open(edit_config, 'r') as f:
@@ -64,9 +65,17 @@ def parse_edit_config_and_text_encoding(edit_config):
         edit_dict["positive_ids"] = [objects.index(t) for t in targets if t in objects]
         edit_dict["score_threshold"] = edit_config["edit"]["threshold"]
         
-        # text encoding
-        clip_editor = CLIPEditor()
-        text_feature = clip_editor.encode_text([obj.replace("_", " ") for obj in objects])
+        # Use the exact Hugging Face CLIP + PCA coordinate system used by
+        # extract_features.py. Mixing this with the OpenAI `clip` package made
+        # text/image similarity less predictable even for the same ViT-B/32 name.
+        pca_path = edit_config["edit"].get("pca_path", "data/my_scene/pca_model_128.pkl")
+        pca = load_pca(pca_path)
+        if int(pca.n_components_) != feature_dim:
+            raise ValueError(
+                f"Point descriptors are {feature_dim}D but PCA model is "
+                f"{pca.n_components_}D. Editing requires matching dimensions."
+            )
+        text_feature = encode_text([obj.replace("_", " ") for obj in objects], pca, "cuda")
 
         # setup editing
         op_dict = {}
@@ -89,7 +98,9 @@ def parse_edit_config_and_text_encoding(edit_config):
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, edit_config, speedup):
     if edit_config != "no editing":
-        edit_dict, text_feature, target = parse_edit_config_and_text_encoding(edit_config)
+        edit_dict, text_feature, target = parse_edit_config_and_text_encoding(
+            edit_config, gaussians.get_semantic_feature.shape[-1]
+        )
 
         edit_render_path = os.path.join(model_path, name, "ours_{}_{}_{}".format(iteration, next(iter(edit_dict["operations"])), target), "renders")
         edit_gts_path = os.path.join(model_path, name, "ours_{}_{}_{}".format(iteration, next(iter(edit_dict["operations"])), target), "gt")
@@ -112,7 +123,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth") ###
         
         if speedup:
-            gt_feature_map = views[0].semantic_feature.cuda()
+            gt_feature_map = load_feature_map(views[0].semantic_feature)
             feature_out_dim = gt_feature_map.shape[0]
             feature_in_dim = int(feature_out_dim/4)
             cnn_decoder = CNN_decoder(feature_in_dim, feature_out_dim)
@@ -129,7 +140,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         if edit_config != "no editing":
             render_pkg = render_edit(view, gaussians, pipeline, background, text_feature, edit_dict) 
             gt = view.original_image[0:3, :, :]
-            gt_feature_map = view.semantic_feature.cuda() 
+            gt_feature_map = load_feature_map(view.semantic_feature)
             torchvision.utils.save_image(render_pkg["render"], os.path.join(edit_render_path, '{0:05d}'.format(idx) + ".png")) 
             torchvision.utils.save_image(gt, os.path.join(edit_gts_path, '{0:05d}'.format(idx) + ".png"))
             # visualize feature map
@@ -147,13 +158,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             render_pkg = render(view, gaussians, pipeline, background) 
 
             gt = view.original_image[0:3, :, :]
-            if isinstance(view.semantic_feature, str):
-                gt_feature_map = torch.load(view.semantic_feature).cuda()
-            else:
-                gt_feature_map = view.semantic_feature.cuda()
-
-            if len(gt_feature_map.shape) == 3 and gt_feature_map.shape[-1] < gt_feature_map.shape[0]:
-                gt_feature_map = gt_feature_map.permute(2, 0, 1)
+            gt_feature_map = load_feature_map(view.semantic_feature)
                  
             torchvision.utils.save_image(render_pkg["render"], os.path.join(render_path, '{0:05d}'.format(idx) + ".png")) 
             torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
@@ -198,7 +203,9 @@ def render_video(model_path, iteration, views, gaussians, pipeline, background, 
     final_video = cv2.VideoWriter(os.path.join(render_path, 'final_video.mp4'), fourcc, 10, size)
 
     if edit_config != "no editing":
-        edit_dict, text_feature = parse_edit_config_and_text_encoding(edit_config)
+        edit_dict, text_feature, _ = parse_edit_config_and_text_encoding(
+            edit_config, gaussians.get_semantic_feature.shape[-1]
+        )
 
     for idx, pose in enumerate(tqdm(render_poses, desc="Rendering progress")):
         view.world_view_transform = torch.tensor(getWorld2View2(pose[:3, :3].T, pose[:3, 3], view.trans, view.scale)).transpose(0, 1).cuda()
@@ -246,7 +253,9 @@ def render_novel_views(model_path, name, iteration, views, gaussians, pipeline, 
         name = name + "_multi_interpolate"
     # make dirs
     if edit_config != "no editing":
-        edit_dict, text_feature, target = parse_edit_config_and_text_encoding(edit_config)
+        edit_dict, text_feature, target = parse_edit_config_and_text_encoding(
+            edit_config, gaussians.get_semantic_feature.shape[-1]
+        )
         
         # edit
         edit_render_path = os.path.join(model_path, name, "ours_{}_{}_{}".format(iteration, next(iter(edit_dict["operations"])), target), "renders")
@@ -263,7 +272,7 @@ def render_novel_views(model_path, name, iteration, views, gaussians, pipeline, 
         decoder_ckpt_path = os.path.join(model_path, "decoder_chkpnt{}.pth".format(iteration))
 
         if speedup:
-            gt_feature_map = views[0].semantic_feature.cuda()
+            gt_feature_map = load_feature_map(views[0].semantic_feature)
             feature_out_dim = gt_feature_map.shape[0]
             feature_in_dim = int(feature_out_dim/4)
             cnn_decoder = CNN_decoder(feature_in_dim, feature_out_dim)
@@ -294,7 +303,7 @@ def render_novel_views(model_path, name, iteration, views, gaussians, pipeline, 
         if edit_config != "no editing":
             render_pkg = render_edit(view, gaussians, pipeline, background, text_feature, edit_dict)
             gt = view.original_image[0:3, :, :]
-            gt_feature_map = view.semantic_feature.cuda()
+            gt_feature_map = load_feature_map(view.semantic_feature)
             torchvision.utils.save_image(render_pkg["render"], os.path.join(edit_render_path, '{0:05d}'.format(idx) + ".png")) 
             # visualize feature map
             feature_map = render_pkg["feature_map"] 
@@ -308,7 +317,7 @@ def render_novel_views(model_path, name, iteration, views, gaussians, pipeline, 
             # mlp encoder
             render_pkg = render(view, gaussians, pipeline, background) 
 
-            gt_feature_map = view.semantic_feature.cuda() 
+            gt_feature_map = load_feature_map(view.semantic_feature)
             torchvision.utils.save_image(render_pkg["render"], os.path.join(render_path, '{0:05d}'.format(idx) + ".png")) 
             # visualize feature map
             feature_map = render_pkg["feature_map"]
@@ -335,7 +344,9 @@ def render_novel_video(model_path, name, iteration, views, gaussians, pipeline, 
     final_video = cv2.VideoWriter(os.path.join(render_path, 'final_video.mp4'), fourcc, 10, size)
 
     if edit_config != "no editing":
-        edit_dict, text_feature = parse_edit_config_and_text_encoding(edit_config)
+        edit_dict, text_feature, _ = parse_edit_config_and_text_encoding(
+            edit_config, gaussians.get_semantic_feature.shape[-1]
+        )
     
     render_poses = [(cam.R, cam.T) for cam in views]
     render_poses = []
@@ -365,7 +376,9 @@ def render_novel_video(model_path, name, iteration, views, gaussians, pipeline, 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, novel_view : bool, 
                 video : bool , edit_config: str, novel_video : bool, multi_interpolate : bool, num_views : int): 
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.sh_degree)
+        gaussians = GaussianModel(
+            dataset.sh_degree, getattr(dataset, "semantic_feature_dim", 128)
+        )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
