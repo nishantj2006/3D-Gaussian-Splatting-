@@ -230,7 +230,7 @@ def refine_object_footprint(original, pruned, coarse_missing, seed=0, cell=0.025
     return original[~refined_missing].copy(), refined_missing, details
 
 
-def choose_donor(uv, distance, vertices, target, low, cell):
+def choose_donor(uv, distance, vertices, target, low, cell, forced_shift=None):
     # Search a bounded neighborhood. Distant parts of a room may have a
     # different material, lighting, or even a different physical plane.
     center = low + np.array(target.shape) * cell / 2
@@ -264,12 +264,27 @@ def choose_donor(uv, distance, vertices, target, low, cell):
     covered = ndimage.maximum_filter(counts > 0, size=3)
     extent = np.array(target.shape) * cell
     target_lum = float(np.median(donor_lum))
+    target_centers = low + (np.argwhere(target) + 0.5) * cell if forced_shift is not None else None
     best = None
-    for step_u in range(-120, 121, 4):
-        for step_v in range(-120, 121, 4):
+    if forced_shift is None:
+        u_steps = range(-120, 121, 4)
+        v_steps = range(-120, 121, 4)
+    else:
+        forced_shift = np.asarray(forced_shift, dtype=np.float64)
+        if forced_shift.shape != (2,) or not np.all(np.isfinite(forced_shift)):
+            raise ValueError("--donor-shift requires two finite plane offsets")
+        steps = np.rint(forced_shift / cell).astype(int)
+        if not np.allclose(steps * cell, forced_shift, atol=1e-6) or np.any(np.abs(steps) > 120):
+            raise ValueError("--donor-shift must align to --cell and stay inside the donor search grid")
+        u_steps, v_steps = (int(steps[0]),), (int(steps[1]),)
+    for step_u in u_steps:
+        for step_v in v_steps:
             shift = np.array([step_u, step_v]) * cell
-            if np.all(np.abs(shift) < extent + 0.12):
+            if forced_shift is None and np.all(np.abs(shift) < extent + 0.12):
                 continue  # Entire donor patch must be outside the hole.
+            if forced_shift is not None and mask_lookup(
+                    target_centers - shift, target, low, cell).any():
+                continue  # Never use Gaussians from the deleted region as donor texture.
             source = target_ij - np.array([step_u, step_v])
             if np.any(source < 0) or np.any(source >= grid_shape):
                 continue
@@ -349,11 +364,36 @@ def select_texture_view(points, donor_vertices, cameras_path, images_dir, prefer
     return camera, path, best[0]
 
 
+def fit_local_color_correction(ring_uv, target_rgb, donor_rgb, fill_uv, center):
+    """Fit a low-frequency RGB correction from intact carpet around a hole."""
+    if len(ring_uv) < 100:
+        raise ValueError("Not enough clean carpet around the hole for local color matching")
+    ring_xy = np.clip(ring_uv - center, -2.0, 2.0)
+    design = np.column_stack((np.ones(len(ring_xy)), ring_xy))
+    difference = np.clip(target_rgb - donor_rgb, -0.25, 0.25)
+    weights = np.ones(len(ring_xy))
+    for _ in range(4):
+        root = np.sqrt(weights)
+        regularizer = np.diag([0.0, 0.35, 0.35])
+        matrix = np.vstack((design * root[:, None], regularizer))
+        values = np.vstack((difference * root[:, None], np.zeros((3, 3))))
+        coefficients = np.linalg.lstsq(matrix, values, rcond=None)[0]
+        residual = np.mean(np.abs(design @ coefficients - difference), axis=1)
+        weights = np.clip(0.08 / np.maximum(residual, 1e-6), 0.2, 1.0)
+    coefficients[0] = np.clip(coefficients[0], -0.15, 0.15)
+    coefficients[1:] = np.clip(coefficients[1:], -0.12, 0.12)
+    fill_design = np.column_stack((np.ones(len(fill_uv)), np.clip(fill_uv - center, -2.0, 2.0)))
+    correction = np.clip(fill_design @ coefficients, -0.18, 0.18)
+    return correction, coefficients
+
+
 def build_candidate(original, pruned, missing, cameras_path, images_dir, *, seed=0,
                     cell=0.025, grid_step=0.006, repair_margin=0.05,
                     cleanup_height=0.18, donor_view=None,
                     extra_repair_mask=None, extra_repair_view=None,
-                    extra_mask_margin=0.05):
+                    extra_mask_margin=0.05, donor_shift=None,
+                    local_color_match=False, seam_blend_width=0.0,
+                    distance_support_scale=0.0):
     xyz = xyz_of(original)
     kept_xyz = xyz_of(pruned)
     origin, normal, u, v, plane_ratio = fit_plane(kept_xyz, xyz[missing], seed=seed)
@@ -366,7 +406,8 @@ def build_candidate(original, pruned, missing, cameras_path, images_dir, *, seed
         target, low, extra_cells = extend_target_from_view_mask(
             target, low, cell, extra_repair_mask, extra_repair_view,
             cameras_path, origin, normal, u, v, extra_mask_margin)
-    selected, shift, coverage, donor_lum = choose_donor(kept_uv, kept_dist, pruned, target, low, cell)
+    selected, shift, coverage, donor_lum = choose_donor(
+        kept_uv, kept_dist, pruned, target, low, cell, forced_shift=donor_shift)
 
     # Remove existing shadow/base splats inside the repair region. Background
     # farther from the plane is deliberately left alone.
@@ -379,12 +420,21 @@ def build_candidate(original, pruned, missing, cameras_path, images_dir, *, seed
     texture_view = camera["img_name"]
     if grid_step <= 0 or grid_step > cell:
         raise ValueError("--grid-step must be positive and no larger than --cell")
-    n_fine = np.ceil(np.array(target.shape) * cell / grid_step).astype(int)
+    if seam_blend_width < 0 or seam_blend_width > 0.25:
+        raise ValueError("--seam-blend-width must be between 0 and 0.25 m")
+    blend_cells = int(np.ceil(seam_blend_width / cell))
+    if blend_cells:
+        fill_target = ndimage.binary_dilation(
+            np.pad(target, blend_cells), iterations=blend_cells)
+        fill_low = low - blend_cells * cell
+    else:
+        fill_target, fill_low = target, low
+    n_fine = np.ceil(np.array(fill_target.shape) * cell / grid_step).astype(int)
     if np.prod(n_fine) > 1000000:
         raise ValueError("Texture grid is too large; increase --grid-step")
     mesh = np.stack(np.meshgrid(np.arange(n_fine[0]), np.arange(n_fine[1]), indexing="ij"), -1)
-    fill_uv = low + (mesh.reshape(-1, 2) + 0.5) * grid_step
-    fill_uv = fill_uv[mask_lookup(fill_uv, target, low, cell)]
+    fill_uv = fill_low + (mesh.reshape(-1, 2) + 0.5) * grid_step
+    fill_uv = fill_uv[mask_lookup(fill_uv, fill_target, fill_low, cell)]
     source_uv = fill_uv - shift
     donor_xyz = origin + source_uv[:, 0, None] * u + source_uv[:, 1, None] * v
     sampled, valid = sample_camera_colors(donor_xyz, camera, image_path)
@@ -392,6 +442,7 @@ def build_candidate(original, pruned, missing, cameras_path, images_dir, *, seed
         raise ValueError("Donor texture image does not cover enough of the synthesized patch")
     fill_uv = fill_uv[valid]
     sampled = sampled[valid]
+    raw_sampled = sampled.copy()
     padded = np.pad(target, 20)
     ring_mask = ndimage.binary_dilation(padded, iterations=16) & ~ndimage.binary_dilation(padded, iterations=4)
     ring_points = mask_lookup(kept_uv, ring_mask, low - 20 * cell, cell) & (np.abs(kept_dist) < 0.055)
@@ -408,6 +459,30 @@ def build_candidate(original, pruned, missing, cameras_path, images_dir, *, seed
             color_delta = np.zeros(3)
     else:
         color_delta = np.zeros(3)
+    local_color_samples = 0
+    color_coefficients = None
+    if local_color_match:
+        if len(ring_indices) < 100:
+            raise ValueError("Not enough surrounding carpet for local color matching")
+        ring_source_uv = kept_uv[ring_indices] - shift
+        ring_source_xyz = (origin + ring_source_uv[:, 0, None] * u
+                           + ring_source_uv[:, 1, None] * v)
+        donor_ring_colors, donor_ring_valid = sample_camera_colors(
+            ring_source_xyz, camera, image_path)
+        expected_ring = np.column_stack(
+            [pruned[f"f_dc_{i}"][ring_indices] for i in range(3)]) * 0.2820947918 + 0.5
+        ring_scale = np.exp(np.column_stack(
+            [pruned[f"scale_{i}"][ring_indices] for i in range(3)])).max(axis=1)
+        clean_ring = (ring_valid & donor_ring_valid & (ring_scale < 0.035)
+                      & (np.mean(np.abs(ring_colors - expected_ring), axis=1) < 0.18))
+        local_color_samples = int(clean_ring.sum())
+        center_uv = low + np.array(target.shape) * cell / 2
+        correction, coefficients = fit_local_color_correction(
+            kept_uv[ring_indices][clean_ring], ring_colors[clean_ring],
+            donor_ring_colors[clean_ring], fill_uv, center_uv)
+        sampled = np.clip(raw_sampled + correction, 0.0, 1.0)
+        color_delta = np.median(correction, axis=0)
+        color_coefficients = coefficients.tolist()
     from scipy.spatial import cKDTree
     nearest = cKDTree(kept_uv[selected]).query(fill_uv - shift, k=1)[1]
     clones = pruned[selected[nearest]].copy()
@@ -425,21 +500,58 @@ def build_candidate(original, pruned, missing, cameras_path, images_dir, *, seed
     clones["rot_0"] = 1.0
     for i in range(1, 4):
         clones[f"rot_{i}"] = 0.0
-    cell_distance = ndimage.distance_transform_edt(target) * cell
-    clone_ij = np.floor((fill_uv - low) / cell).astype(int)
-    fade = np.clip(cell_distance[clone_ij[:, 0], clone_ij[:, 1]] / 0.07, 0.12, 1.0)
-    opacity = np.clip(0.82 * fade, 0.03, 0.98)
+    if blend_cells:
+        padded_target = np.pad(target, blend_cells)
+        clone_ij = np.floor((fill_uv - fill_low) / cell).astype(int)
+        inside = padded_target[clone_ij[:, 0], clone_ij[:, 1]]
+        inner_distance = ndimage.distance_transform_edt(padded_target) * cell
+        outer_distance = ndimage.distance_transform_edt(~padded_target) * cell
+        inner_opacity = 0.82 * np.clip(
+            inner_distance[clone_ij[:, 0], clone_ij[:, 1]] / 0.07, 0.6, 1.0)
+        outer_fade = np.clip(
+            1.0 - outer_distance[clone_ij[:, 0], clone_ij[:, 1]]
+            / (seam_blend_width + cell), 0.0, 1.0)
+        opacity = np.where(inside, inner_opacity, 0.45 * outer_fade ** 2)
+    else:
+        cell_distance = ndimage.distance_transform_edt(target) * cell
+        clone_ij = np.floor((fill_uv - low) / cell).astype(int)
+        fade = np.clip(cell_distance[clone_ij[:, 0], clone_ij[:, 1]] / 0.07, 0.12, 1.0)
+        opacity = 0.82 * fade
+    opacity = np.clip(opacity, 0.03, 0.98)
     clones["opacity"] = np.log(opacity / (1 - opacity)).astype(np.float32)
     if "object_id" in clones.dtype.names:
         clones["object_id"] = 0
-    candidate = np.concatenate((pruned[~replace], clones))
+    # A sparse, larger-footprint carpet layer remains visible when the fine
+    # texture Gaussians project to subpixel sizes in some viewers. Keep it just
+    # behind the fine layer so nearby views retain their detailed texture.
+    if distance_support_scale:
+        if not 2 * grid_step <= distance_support_scale <= 0.03:
+            raise ValueError("--distance-support-scale must be at least twice --grid-step and at most 0.03 m")
+        stride = max(2, round(distance_support_scale / grid_step))
+        grid = np.rint((fill_uv - fill_uv.min(axis=0)) / grid_step).astype(int)
+        support_mask = ((grid[:, 0] % stride == 0) & (grid[:, 1] % stride == 0)
+                        & (opacity > 0.5))
+        support = clones[support_mask].copy()
+        for i, axis in enumerate(("x", "y", "z")):
+            support[axis] -= 0.005 * normal[i]
+            support[f"scale_{i}"] = np.log(distance_support_scale)
+        support["opacity"] = np.log(0.75 / 0.25)
+    else:
+        support = clones[:0].copy()
+        stride = 0
+    candidate = np.concatenate((pruned[~replace], clones, support))
     details = {
         "plane_origin": origin.tolist(), "plane_normal_toward_removed_object": normal.tolist(),
         "plane_inlier_ratio": plane_ratio, "footprint_basis": basis,
         "target_cells": int(target.sum()), "target_cell_size": cell,
         "donor_shift_uv": shift.tolist(), "donor_coverage": coverage,
         "donor_mean_luminance": donor_lum, "removed_residual_surface_points": int(replace.sum()),
-        "added_donor_gaussians": int(len(clones)), "candidate_points": int(len(candidate)),
+        "added_donor_gaussians": int(len(clones) + len(support)),
+        "fine_fill_gaussians": int(len(clones)),
+        "distance_support_gaussians": int(len(support)),
+        "distance_support_scale": float(distance_support_scale),
+        "distance_support_stride": int(stride),
+        "candidate_points": int(len(candidate)),
         "donor_texture_view": texture_view, "donor_view_score": view_score,
         "texture_grid_step": grid_step,
         "repair_margin": repair_margin,
@@ -447,6 +559,10 @@ def build_candidate(original, pruned, missing, cameras_path, images_dir, *, seed
         "extra_repair_cells": extra_cells,
         "extra_mask_margin": extra_mask_margin,
         "texture_color_delta": color_delta.tolist(),
+        "local_color_match": bool(local_color_match),
+        "local_color_samples": local_color_samples,
+        "local_color_coefficients": color_coefficients,
+        "seam_blend_width": seam_blend_width,
     }
     return candidate, details
 
@@ -457,6 +573,34 @@ def sha256(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def exclude_original_records(original, candidate, added_count, indices):
+    """Remove explicitly reviewed residual splats by their original PLY row."""
+    if not indices:
+        return candidate, []
+    if len(set(indices)) != len(indices):
+        raise ValueError("Duplicate --exclude-original-index values")
+    kept_count = len(candidate) - added_count
+    if kept_count < 0:
+        raise ValueError("Invalid candidate fill count")
+    keep = np.ones(len(candidate), dtype=bool)
+    for index in sorted(indices):
+        if index < 0 or index >= len(original):
+            raise ValueError(f"Original PLY index {index} is out of range")
+        source = original[index]
+        matches = np.flatnonzero(
+            (candidate["x"][:kept_count] == source["x"]) &
+            (candidate["y"][:kept_count] == source["y"]) &
+            (candidate["z"][:kept_count] == source["z"]))
+        exact = [position for position in matches
+                 if candidate[position].tobytes() == source.tobytes()]
+        if len(exact) != 1:
+            raise ValueError(
+                f"Original PLY index {index} is not uniquely present in the candidate; "
+                "it may already be removed")
+        keep[exact[0]] = False
+    return candidate[keep], sorted(indices)
 
 
 def preview(args):
@@ -498,7 +642,16 @@ def preview(args):
                                          donor_view=args.donor_view,
                                          extra_repair_mask=args.extra_repair_mask,
                                          extra_repair_view=args.extra_repair_view,
-                                         extra_mask_margin=args.extra_mask_margin)
+                                         extra_mask_margin=args.extra_mask_margin,
+                                         donor_shift=args.donor_shift,
+                                         local_color_match=args.local_color_match,
+                                         seam_blend_width=args.seam_blend_width,
+                                         distance_support_scale=args.distance_support_scale)
+    candidate, excluded = exclude_original_records(
+        original, candidate, details["added_donor_gaussians"], args.exclude_original_index)
+    details["excluded_original_indices"] = excluded
+    details["excluded_residual_points"] = len(excluded)
+    details["candidate_points"] = len(candidate)
     if refinement:
         details.update(refinement)
     if args.dry_run:
@@ -611,6 +764,16 @@ def main():
     prepare.add_argument("--extra-mask-margin", type=float, default=0.05,
                          help="Plane-space dilation around the extra repair mask")
     prepare.add_argument("--donor-view", help="Optional source camera for donor texture; auto-select by default")
+    prepare.add_argument("--donor-shift", nargs=2, type=float, metavar=("U", "V"),
+                         help="Plane-space donor offset, quantized to --cell, for texture alignment")
+    prepare.add_argument("--local-color-match", action="store_true",
+                         help="Fit spatial RGB correction from intact carpet around the hole")
+    prepare.add_argument("--seam-blend-width", type=float, default=0.0,
+                         help="Add a feathered Gaussian overlap band outside the hole, in meters")
+    prepare.add_argument("--distance-support-scale", type=float, default=0.0,
+                         help="Sparse larger carpet layer behind fine splats for distant viewers (meters)")
+    prepare.add_argument("--exclude-original-index", type=int, action="append", default=[],
+                         help="Remove one visually confirmed residual Gaussian by original PLY row index")
     prepare.add_argument("--refine-mask", action="store_true",
                          help="Tighten an overbroad box cut to the object's plane-projected footprint")
     prepare.add_argument("--render-width", type=int, default=540)

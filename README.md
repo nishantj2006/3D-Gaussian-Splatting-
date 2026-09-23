@@ -170,8 +170,28 @@ PNG from one of the `*-pruned.png` views and rerun `preview` with
 back-projects that mask to the plane, copies it into the preview directory,
 and includes it in the same 3D patch. `--extra-mask-margin` expands the marked
 region to cover splats whose centers lie outside their rendered footprint.
+If a few oversized residual splats still visibly overlap the fill, isolate
+and review them before passing their **original PLY row indices** with
+`--exclude-original-index N` (repeatable). This is an explicit, auditable
+exception rather than a broad automatic deletion; `preview.json` records
+the excluded indices. Never use candidate PLY row numbers here.
+For a visible texture boundary, `--donor-shift U V` selects a nearby
+plane-aligned donor offset (both numbers must be multiples of `--cell`).
+`--local-color-match` fits a low-frequency RGB correction using intact
+carpet around the hole. `--seam-blend-width 0.05` adds a 5 cm feathered
+overlap of new Gaussians; wider bands may double or blur the weave.
+Always compare multiple rendered views before accepting a seam adjustment.
+If a viewer loses the fine fill at a distance, `--distance-support-scale 0.014`
+adds a sparse, larger-footprint carpet layer just behind it. The default is
+off. This is a viewer-compatibility preview option, not proof that a particular
+viewer will render the repair correctly; inspect both near and far views.
 The tool rejects an unreliable plane or donor patch instead of silently
 applying a poor fill.
+
+For a remaining low-frequency color boundary, `refine_fill_color.py` takes an
+unapproved preview, a near-normal diagnostic camera JSON, and its rendered
+image. It fits a conservative RGB gradient and saves a separate preview;
+geometry, opacity, and semantic features are unchanged. Review the new PLY
 
 Only after visual approval, copy the unchanged candidate to a new final path:
 

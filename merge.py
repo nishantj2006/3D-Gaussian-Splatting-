@@ -24,11 +24,21 @@ def parse_args():
 
 
 def merge(args):
-    if args.scale <= 0:
-        raise ValueError("--scale must be positive")
+    output = Path(args.output).resolve()
+    if output.exists() or output.with_suffix(".objects.json").exists():
+        raise ValueError("Refusing to overwrite an existing merge output")
+    if not np.isfinite(args.scale) or args.scale <= 0:
+        raise ValueError("--scale must be finite and positive")
+    if not np.all(np.isfinite(args.translate)):
+        raise ValueError("--translate must be finite")
+    if args.object_id <= 0:
+        raise ValueError("--object-id must be positive")
     scene_ply, scene = read_vertices(args.scene)
     _, asset = read_vertices(args.asset)
-    scene = add_float_property(scene, "object_id", 0.0)
+    if "object_id" in scene.dtype.names and np.any(np.isclose(scene["object_id"], args.object_id)):
+        raise ValueError(f"Scene already contains object_id {args.object_id}")
+    if "object_id" not in scene.dtype.names:
+        scene = add_float_property(scene, "object_id", 0.0)
     asset = add_float_property(asset, "object_id", float(args.object_id))
     asset = align_dtype(asset, scene.dtype)
     for field, offset in zip(("x", "y", "z"), args.translate):

@@ -7,11 +7,50 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from reconstruct_flat import (build_candidate, choose_donor, commit, extend_target_from_view_mask,
+from reconstruct_flat import (build_candidate, choose_donor, commit, exclude_original_records,
+                              extend_target_from_view_mask, fit_local_color_correction,
                               fit_plane, make_target, removed_indices, sha256)
 
 
 class ReconstructFlatTests(unittest.TestCase):
+    def test_local_color_fit_recovers_gradient_and_rejects_sparse_boundary(self):
+        rng = np.random.default_rng(13)
+        ring_uv = rng.uniform(-0.6, 0.6, (500, 2))
+        donor = np.full((500, 3), 0.55)
+        true_offset = np.array([0.04, -0.03, 0.02])
+        true_slope = np.array([[0.035, 0.015, -0.02],
+                               [-0.025, 0.01, 0.025]])
+        target = donor + true_offset + ring_uv @ true_slope
+        target[:30] += 0.4  # Outliers should not determine the correction.
+        fill_uv = rng.uniform(-0.4, 0.4, (100, 2))
+        correction, coefficients = fit_local_color_correction(
+            ring_uv, target, donor, fill_uv, np.zeros(2))
+        expected = true_offset + fill_uv @ true_slope
+        self.assertLess(np.mean(np.abs(correction - expected)), 0.02)
+        self.assertEqual(coefficients.shape, (3, 3))
+        with self.assertRaisesRegex(ValueError, "Not enough clean carpet"):
+            fit_local_color_correction(
+                ring_uv[:50], target[:50], donor[:50], fill_uv, np.zeros(2))
+
+    def test_reviewed_residual_exclusion_preserves_fill_and_rejects_invalid_rows(self):
+        dtype = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                          ("semantic_0", "<f4")])
+        original = np.zeros(3, dtype=dtype)
+        original["x"] = [1, 2, 3]
+        original["semantic_0"] = [0.1, 0.2, 0.3]
+        candidate = np.concatenate((original, original[:1].copy()))
+        candidate[-1]["x"] = 4
+        result, indices = exclude_original_records(original, candidate, 1, [1])
+        self.assertEqual(indices, [1])
+        np.testing.assert_array_equal(result["x"], [1, 3, 4])
+        np.testing.assert_allclose(result["semantic_0"], [0.1, 0.3, 0.1])
+        with self.assertRaisesRegex(ValueError, "Duplicate"):
+            exclude_original_records(original, candidate, 1, [1, 1])
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            exclude_original_records(original, candidate, 1, [3])
+        with self.assertRaisesRegex(ValueError, "already be removed"):
+            exclude_original_records(original, candidate[[0, 2, 3]], 1, [1])
+
     def test_ordered_subset_and_schema_validation(self):
         dtype = np.dtype([("x", "f4"), ("y", "f4"), ("z", "f4"), ("semantic_0", "f4")])
         original = np.zeros(4, dtype=dtype)
@@ -105,8 +144,34 @@ class ReconstructFlatTests(unittest.TestCase):
             second, _ = build_candidate(original, pruned, missing, cameras_path, root,
                                         seed=3, cell=0.025, grid_step=0.01,
                                         repair_margin=0)
+            blended, blended_details = build_candidate(
+                original, pruned, missing, cameras_path, root,
+                seed=3, cell=0.025, grid_step=0.01, repair_margin=0,
+                local_color_match=True, seam_blend_width=0.05)
+            supported, supported_details = build_candidate(
+                original, pruned, missing, cameras_path, root,
+                seed=3, cell=0.025, grid_step=0.01, repair_margin=0,
+                distance_support_scale=0.02)
+            with self.assertRaisesRegex(ValueError, "at least twice"):
+                build_candidate(original, pruned, missing, cameras_path, root,
+                                seed=3, cell=0.025, grid_step=0.01, repair_margin=0,
+                                distance_support_scale=0.015)
+            with self.assertRaisesRegex(ValueError, "align to --cell"):
+                build_candidate(original, pruned, missing, cameras_path, root,
+                                seed=3, cell=0.025, grid_step=0.01, repair_margin=0,
+                                donor_shift=(0.012, 0.0))
         self.assertEqual(first.dtype, original.dtype)
         self.assertTrue(np.array_equal(first, second))
+        self.assertGreater(len(blended), len(first))
+        self.assertGreater(blended_details["local_color_samples"], 100)
+        self.assertEqual(blended.dtype, original.dtype)
+        self.assertEqual(supported.dtype, original.dtype)
+        self.assertGreater(supported_details["distance_support_gaussians"], 0)
+        self.assertTrue(np.array_equal(supported[:len(first)], first))
+        support = supported[-supported_details["distance_support_gaussians"]:]
+        self.assertTrue(np.allclose(np.exp(support["scale_0"]), 0.02))
+        self.assertTrue(np.all(support["semantic_0"] == 0.8))
+        self.assertTrue(np.all(support["semantic_1"] == 0.2))
         self.assertGreater(details["added_donor_gaussians"], 500)
         clones = first[-details["added_donor_gaussians"]:]
         self.assertTrue(np.all(clones["object_id"] == 0))
