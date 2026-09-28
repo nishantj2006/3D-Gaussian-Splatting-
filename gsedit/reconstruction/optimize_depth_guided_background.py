@@ -1,0 +1,233 @@
+"""Locally optimize validated replacement Gaussians using shared RGB-D targets.
+
+Requires separately validated geometry and depth priors. Incomplete masks,
+rejected depth views, or weak geometry stop before an edited PLY is written.
+Unrelated source records and all 128 semantic features remain frozen.
+"""
+
+import argparse
+import json
+from pathlib import Path
+import resource
+import time
+
+import numpy as np
+from PIL import Image
+import torch
+import torch.nn.functional as F
+from diff_gaussian_rasterization import GaussianRasterizer
+
+from gsedit.evaluation.evaluate_rendered_masks import camera_settings
+from scene.gaussian_model import GaussianModel
+from utils.ply_semantic_utils import read_vertices, write_vertices
+
+
+def validate_inputs(seed_report, geometry, priors, masks, holdouts, length, min_views):
+    if not geometry.get("geometry_supported"):
+        raise ValueError("Geometry gate failed; refusing 3D optimization")
+    checked = geometry.get("heldout_views", {})
+    if not set(holdouts).issubset(checked) or sum(
+            bool(checked[v].get("supported")) for v in holdouts) < 2:
+        raise ValueError("Held-out depth/reprojection gate failed")
+    if geometry.get("supported_views", 0) < 2:
+        raise ValueError("Too few geometry-supported held-out views")
+    first_new = seed_report.get("original_kept")
+    if not isinstance(first_new, int) or not 0 < first_new < length:
+        raise ValueError("Missing original/new Gaussian boundary")
+    train = sorted(v for v, entry in priors["views"].items() if entry.get("accepted")
+                   and v not in holdouts and masks["views"].get(v, {}).get("complete", True)
+                   and masks["views"].get(v, {}).get("accepted"))
+    if len(train) < min_views:
+        raise ValueError("Too few accepted, complete RGB-D training views")
+    return first_new, train
+
+
+def render(model, raster, xyz, scale, rotation, opacity, shs):
+    image, _, _, depth = raster(
+        means3D=xyz, means2D=torch.zeros_like(xyz), shs=shs,
+        colors_precomp=None, semantic_feature=model.get_semantic_feature,
+        opacities=opacity, scales=scale, rotations=rotation, cov3D_precomp=None)
+    return image.clamp(0, 1), depth.clamp_min(0)
+
+
+def masked_l1(pred, target, mask):
+    return ((pred-target).abs()*mask).sum()/(mask.sum()*pred.shape[0]+1)
+
+
+def run(args):
+    output = Path(args.output_dir).resolve()
+    if output.exists():
+        raise FileExistsError(output)
+    started = time.perf_counter()
+    header, vertices = read_vertices(args.seed)
+    reports = {}
+    for label, path in (("seed", args.seed_report), ("geometry", args.geometry_report),
+                        ("priors", args.depth_report), ("masks", args.target_manifest)):
+        with open(path, encoding="utf-8") as handle:
+            reports[label] = json.load(handle)
+    first_new, training = validate_inputs(reports["seed"], reports["geometry"],
+        reports["priors"], reports["masks"], set(args.holdout_views),
+        len(vertices), args.min_training_views)
+    with open(args.cameras, encoding="utf-8") as handle:
+        cameras = {x["img_name"]: x for x in json.load(handle)}
+    with np.load(args.boundary_evidence, allow_pickle=False) as data:
+        source_boundary = data["indices"][(data["gate"] > args.hard_gate) &
+                                           (data["gate"] < 1)]
+    boundary = np.unique(source_boundary[source_boundary < first_new])
+    if len(boundary) > args.max_boundary_splats:
+        raise ValueError("Unsafe mixed-boundary pool")
+    model = GaussianModel(3, 128)
+    model.load_ply(args.seed)
+    for key in ("_xyz", "_features_dc", "_features_rest", "_opacity", "_scaling",
+                "_rotation", "_semantic_feature"):
+        getattr(model, key).requires_grad_(False)
+    new = torch.arange(first_new, len(vertices), device="cuda")
+    mixed = torch.as_tensor(boundary, device="cuda", dtype=torch.long)
+    base_xyz = model.get_xyz.detach()
+    base_scale = model._scaling.detach()
+    base_rotation = model._rotation.detach()
+    base_raw_alpha = model._opacity.detach()
+    base_dc = model._features_dc.detach()
+    xyz_delta = torch.nn.Parameter(torch.zeros((len(new), 3), device="cuda"))
+    scale_delta = torch.nn.Parameter(torch.zeros((len(new), 3), device="cuda"))
+    rotation_delta = torch.nn.Parameter(torch.zeros((len(new), 4), device="cuda"))
+    alpha_delta = torch.nn.Parameter(torch.zeros((len(new), 1), device="cuda"))
+    dc_delta = torch.nn.Parameter(torch.zeros((len(new), 1, 3), device="cuda"))
+    mixed_alpha_delta = torch.nn.Parameter(torch.zeros((len(mixed), 1), device="cuda"))
+    params = [xyz_delta, scale_delta, rotation_delta, alpha_delta, dc_delta,
+              mixed_alpha_delta]
+    optimizer = torch.optim.Adam(params, lr=args.learning_rate)
+    views = {}
+    for view in training:
+        camera = cameras[view]
+        guide_path = Path(args.guides) / f"{view}{args.guide_suffix}"
+        original = [p for p in Path(args.images).glob(view + ".*") if
+                    p.suffix.lower() in (".jpg", ".jpeg", ".png")]
+        if not guide_path.exists() or len(original) != 1:
+            raise FileNotFoundError(f"Missing guide or original photo: {view}")
+        guide_image = Image.open(guide_path).convert("RGB")
+        width = args.width
+        height = round(camera["height"]*width/camera["width"])
+        size = (width, height)
+        guide = np.asarray(guide_image.resize(size, Image.Resampling.BILINEAR),
+                           dtype=np.float32)/255
+        photo = np.asarray(Image.open(original[0]).convert("RGB").resize(
+            size, Image.Resampling.BILINEAR), dtype=np.float32)/255
+        mask = np.asarray(Image.open(reports["masks"]["views"][view]["mask_path"])
+                          .convert("L").resize(size, Image.Resampling.NEAREST)) > 127
+        depth = np.load(Path(args.depth_report).parent/f"{view}-prior-depth.npy",
+                        allow_pickle=False)
+        depth = np.asarray(Image.fromarray(depth).resize(size, Image.Resampling.BILINEAR))
+        valid = mask & np.isfinite(depth) & (depth > 0)
+        if valid.sum() < args.min_depth_pixels:
+            raise ValueError(f"Insufficient accepted depth in {view}")
+        as_tensor = lambda array: torch.from_numpy(array.astype(np.float32)).cuda()
+        views[view] = (GaussianRasterizer(camera_settings(camera, height, width)._replace(
+                           sh_degree=3)),
+                       as_tensor(guide).permute(2, 0, 1),
+                       as_tensor(photo).permute(2, 0, 1),
+                       as_tensor(mask)[None], as_tensor(depth)[None],
+                       as_tensor(valid)[None])
+    torch.cuda.reset_peak_memory_stats()
+    history = []
+    for epoch in range(args.epochs):
+        totals = []
+        for view in training:
+            optimizer.zero_grad(set_to_none=True)
+            xyz = base_xyz.index_copy(0, new, base_xyz[new] +
+                xyz_delta.clamp(-args.max_xyz_shift, args.max_xyz_shift))
+            scales = torch.exp(base_scale.index_copy(0, new, base_scale[new] +
+                scale_delta.clamp(-args.max_log_scale_shift, args.max_log_scale_shift)))
+            rotation = F.normalize(base_rotation.index_copy(0, new, base_rotation[new] +
+                rotation_delta.clamp(-args.max_rotation_shift, args.max_rotation_shift)), dim=1)
+            raw_alpha = base_raw_alpha.index_copy(0, new, base_raw_alpha[new] +
+                alpha_delta.clamp(-args.max_alpha_shift, args.max_alpha_shift))
+            if len(mixed):
+                raw_alpha = raw_alpha.index_copy(0, mixed, base_raw_alpha[mixed] +
+                    mixed_alpha_delta.clamp(-args.max_boundary_shift, args.max_boundary_shift))
+            dc = base_dc.index_copy(0, new, base_dc[new] +
+                dc_delta.clamp(-args.max_dc_shift, args.max_dc_shift))
+            shs = torch.cat((dc, model._features_rest.detach()), dim=1)
+            raster, guide, photo, mask, depth_target, depth_valid = views[view]
+            image, depth = render(model, raster, xyz, scales, rotation,
+                                  torch.sigmoid(raw_alpha), shs)
+            outside = masked_l1(image, photo, 1-mask)
+            inside = masked_l1(image, guide, mask)
+            depth_loss = masked_l1(depth, depth_target, depth_valid)
+            regularity = (xyz_delta.square().mean() + scale_delta.square().mean() +
+                          rotation_delta.square().mean() + dc_delta.square().mean())
+            loss = (args.outside_weight*outside + inside + args.depth_weight*depth_loss +
+                    args.regularizer_weight*regularity)
+            loss.backward()
+            optimizer.step()
+            totals.append((float(outside.detach()), float(inside.detach()),
+                           float(depth_loss.detach())))
+        history.append({"epoch": epoch+1,
+                        "outside_rgb_l1": float(np.mean([x[0] for x in totals])),
+                        "inside_rgb_l1": float(np.mean([x[1] for x in totals])),
+                        "depth_l1": float(np.mean([x[2] for x in totals]))})
+    result = vertices.copy()
+    for axis, key in enumerate(("x", "y", "z")):
+        result[key][first_new:] += xyz_delta.detach().cpu().numpy()[:, axis].clip(
+            -args.max_xyz_shift, args.max_xyz_shift)
+    for j in range(3):
+        result[f"scale_{j}"][first_new:] += scale_delta.detach().cpu().numpy()[:, j].clip(
+            -args.max_log_scale_shift, args.max_log_scale_shift)
+        result[f"f_dc_{j}"][first_new:] += dc_delta.detach().cpu().numpy()[:, 0, j].clip(
+            -args.max_dc_shift, args.max_dc_shift)
+    rotation_values = F.normalize(base_rotation[new] + rotation_delta.detach().clamp(
+        -args.max_rotation_shift, args.max_rotation_shift), dim=1).cpu().numpy()
+    for j in range(4):
+        result[f"rot_{j}"][first_new:] = rotation_values[:, j]
+    raw = base_raw_alpha[new] + alpha_delta.detach().clamp(-args.max_alpha_shift,
+                                                            args.max_alpha_shift)
+    result["opacity"][first_new:] = raw.cpu().numpy()[:, 0]
+    if len(boundary):
+        raw = base_raw_alpha[mixed] + mixed_alpha_delta.detach().clamp(
+            -args.max_boundary_shift, args.max_boundary_shift)
+        result["opacity"][boundary] = raw.cpu().numpy()[:, 0]
+    output.mkdir(parents=True)
+    candidate = output / "candidate.ply"
+    write_vertices(candidate, result, header,
+                   ["UNAPPROVED geometry-gated local RGB-D optimization"])
+    report = {"candidate": str(candidate), "new_optimized": len(new),
+              "mixed_boundary_optimized": len(mixed), "training_views": training,
+              "holdout_views": args.holdout_views, "history": history,
+              "semantic_dimensions": 128, "approved": False,
+              "elapsed_seconds": time.perf_counter()-started,
+              "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,
+              "peak_gpu_allocated_mb": torch.cuda.max_memory_allocated()/1024**2}
+    with open(output / "report.json", "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2)
+        handle.write("\n")
+    return report
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    for name in ("seed", "seed-report", "geometry-report", "depth-report", "guides",
+                 "images", "cameras", "target-manifest", "boundary-evidence", "output-dir"):
+        p.add_argument("--"+name, required=True)
+    p.add_argument("--holdout-views", nargs="+", default=[])
+    p.add_argument("--guide-suffix", default="-guide.png")
+    p.add_argument("--width", type=int, default=270)
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--learning-rate", type=float, default=.01)
+    p.add_argument("--min-training-views", type=int, default=3)
+    p.add_argument("--min-depth-pixels", type=int, default=1000)
+    p.add_argument("--max-boundary-splats", type=int, default=3000)
+    p.add_argument("--hard-gate", type=float, default=.01)
+    p.add_argument("--max-xyz-shift", type=float, default=.1)
+    p.add_argument("--max-log-scale-shift", type=float, default=.2)
+    p.add_argument("--max-rotation-shift", type=float, default=.1)
+    p.add_argument("--max-alpha-shift", type=float, default=1.)
+    p.add_argument("--max-boundary-shift", type=float, default=.5)
+    p.add_argument("--max-dc-shift", type=float, default=.15)
+    p.add_argument("--outside-weight", type=float, default=3.)
+    p.add_argument("--depth-weight", type=float, default=1.)
+    p.add_argument("--regularizer-weight", type=float, default=.1)
+    return p
+
+
+if __name__ == "__main__":
+    print(json.dumps(run(parser().parse_args()), indent=2))

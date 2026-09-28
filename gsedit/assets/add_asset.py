@@ -6,6 +6,8 @@ be installed separately. The source scene is never modified, and each run
 requires a new output directory.
 """
 
+from gsedit.runtime import PROJECT_ROOT, module_command
+
 import argparse
 import json
 import os
@@ -14,7 +16,7 @@ import subprocess
 import sys
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = PROJECT_ROOT
 
 
 def generate_nano_image(prompt, output, model):
@@ -44,7 +46,7 @@ def generate_nano_image(prompt, output, model):
 
 def local_image_command(args, output):
     """Build the isolated image-generation step without loading model weights."""
-    return [str(args.image_python), str(ROOT / "generate_local_image.py"),
+    return [*module_command("generate_local_image.py", python=str(args.image_python)),
             "--prompt", args.prompt, "--output", str(output),
             "--model", args.local_model, "--steps", str(args.local_steps),
             "--width", str(args.local_width), "--height", str(args.local_height),
@@ -180,7 +182,7 @@ def main(argv=None):
             mesh = tripo_output / "0/mesh.obj"
         record.update({"image": str(image) if image else None, "mesh": str(mesh)})
         raw = output / "asset-raw.ply"
-        bridge_command = [sys.executable, str(ROOT / "bridge.py"), "--mesh", str(mesh),
+        bridge_command = [*module_command("bridge.py", python=sys.executable), "--mesh", str(mesh),
                           "--output", str(raw), "--label", args.prompt,
                           "--object-id", str(args.object_id), "--pca-path", str(args.pca_path),
                           "--points", str(args.points), "--seed", str(args.seed)]
@@ -188,7 +190,7 @@ def main(argv=None):
             bridge_command += ["--reference-image", str(image)]
         run_stage(bridge_command, raw)
         aligned = output / "asset-aligned.ply"
-        align_command = [sys.executable, str(ROOT / "align_asset.py"),
+        align_command = [*module_command("align_asset.py", python=sys.executable),
                          "--asset", str(raw), "--output", str(aligned),
                          "--plane-json", str(args.plane_json),
                          "--asset-up-axis", args.asset_up_axis, *target_flags]
@@ -196,7 +198,7 @@ def main(argv=None):
             align_command += ["--yaw-deg", str(args.yaw_deg)]
         run_stage(align_command, aligned)
         merged = output / "scene-with-asset.ply"
-        run_stage([sys.executable, str(ROOT / "merge.py"), "--scene", str(args.scene),
+        run_stage([*module_command("merge.py", python=sys.executable), "--scene", str(args.scene),
                    "--asset", str(aligned), "--output", str(merged),
                    "--object-id", str(args.object_id), "--label", args.prompt], merged)
         record["outputs"] = {"raw": str(raw), "aligned": str(aligned), "merged": str(merged)}

@@ -1,0 +1,21 @@
+Autonomous planar scene edit (preview only)
+
+The text-targeted interface is `run_generated_background.py --scene ... --images ... --cameras ... --text ... --pca-path ... --output-dir ...`. It never overwrites the input or approves the output. Existing `--config` runs remain supported. Run it with `/home/nishantj/miniforge3/envs/gaussian-orin/bin/python`.
+
+Example (choose a fresh output directory):
+
+```bash
+/home/nishantj/miniforge3/envs/gaussian-orin/bin/python run_generated_background.py \
+  --scene output/bottle-orin-128d-5k/semantic-validation/no-bottle-reconstructed-color-matched.ply \
+  --images data/my_scene/images --cameras output/bottle-orin-128d-5k/cameras.json \
+  --text bed --pca-path data/my_scene/pca_model_128.pkl \
+  --holdout-views frame_0134 frame_0141 frame_0143 \
+  --device cuda --mask-device cuda --backend diffusion \
+  --output-dir output/bed-ops/bed-autonomous-next
+```
+
+For the bed capture, keep `frame_0134`, `frame_0141`, and `frame_0143` held out with `--holdout-views frame_0134 frame_0141 frame_0143`. Use `--backend diffusion` for learned local atlas inpainting (model weights must be available); `--backend opencv` is a geometry/diagnostic fallback, not learned generation. Every run needs a new output directory.
+
+The stages save text seeds, target masks, independently protected instance IDs, safe source IDs, pruned and revealed-layer previews, floor/wall masks and fits, and—only when geometry passes—one shared atlas per surface, a generated PLY, and held-out renders. `workflow-report.json` remains `approved: false` even when all automatic checks pass. A failed stage writes a log and stops before publishing. Surface reconstruction supports approximately planar floor/wall geometry; it cannot recover hidden texture exactly or promise valid non-planar geometry.
+
+Current bed diagnostic: automatic floor fit reached 96.78% inliers (313,545/323,989 points; q90 error 0.0328 scene units). The wall fit reached only 17.96% on the original scene and 19.61% after first removal, below the 30% gate. Thus this capture does not yet produce a geometry-approved 3D replacement. Do not lower the gate to force a candidate. The independent instance pass identified six protected groups and 208,313 protected source Gaussians; 175 of 6,396 initially selected target Gaussians conflicted and were protected, leaving 6,221 safe first-pass removals. These numbers are diagnostics, not a visual approval.

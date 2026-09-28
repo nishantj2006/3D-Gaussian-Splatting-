@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from reconstruct_flat import (build_candidate, choose_donor, commit, exclude_original_records,
+from gsedit.reconstruction.reconstruct_flat import (build_candidate, choose_donor, commit, exclude_original_records,
                               extend_target_from_view_mask, fit_local_color_correction,
                               fit_plane, make_target, removed_indices, sha256)
 

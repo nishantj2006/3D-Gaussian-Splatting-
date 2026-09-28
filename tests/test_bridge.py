@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import trimesh
 
-from bridge import sample_mesh_gaussians
+from gsedit.assets.bridge import sample_mesh_gaussians
 
 
 class MeshSamplingTests(unittest.TestCase):

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
-from merge import merge
+from gsedit.assets.merge import merge
 from utils.ply_semantic_utils import read_vertices, write_vertices
 
 

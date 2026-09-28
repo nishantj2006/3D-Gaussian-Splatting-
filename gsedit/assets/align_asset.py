@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from reconstruct_flat import removed_indices
+from gsedit.reconstruction.reconstruct_flat import removed_indices
 from utils.ply_semantic_utils import read_vertices, write_vertices
 
 

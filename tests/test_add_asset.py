@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from add_asset import (alignment_target, generate_nano_image, local_image_command,
+from gsedit.assets.add_asset import (alignment_target, generate_nano_image, local_image_command,
                        run_stage, validate_generation_requirements)
 
 
@@ -38,8 +38,8 @@ class AssetPipelineTests(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True):
             validate_generation_requirements(args)
         command = local_image_command(args, Path("/tmp/local-sdxl.png"))
-        self.assertEqual(command[:2], [str(Path(sys.executable)), str(
-            Path(__file__).resolve().parents[1] / "generate_local_image.py")])
+        self.assertEqual(command[:3], [str(Path(sys.executable)), "-m",
+                                      "gsedit.generation.generate_local_image"])
         self.assertIn("blue bottle", command)
         self.assertEqual(command[-2:], ["--seed", "7"])
 

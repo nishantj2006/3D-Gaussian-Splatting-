@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from refine_fill_color import adjust_added_colors, boundary_correction, fill_mask
+from gsedit.reconstruction.refine_fill_color import adjust_added_colors, boundary_correction, fill_mask
 
 
 class FillColorTests(unittest.TestCase):

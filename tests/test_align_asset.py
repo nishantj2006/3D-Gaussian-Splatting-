@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from align_asset import (fit_transform, plane_frame, target_from_removal,
+from gsedit.assets.align_asset import (fit_transform, plane_frame, target_from_removal,
                          transform_gaussians)
 
 

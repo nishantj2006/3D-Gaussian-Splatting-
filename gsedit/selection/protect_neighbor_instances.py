@@ -1,0 +1,178 @@
+"""Protect nearby non-target SAM instances as independent 3D source IDs.
+
+No object vocabulary or color is embedded here. Unlabeled image proposals are
+associated across cameras, but never merged with the requested target. Any
+overlap between protected IDs and the initial removal is reported explicitly.
+"""
+
+import argparse
+import json
+from pathlib import Path
+import resource
+import time
+
+import numpy as np
+from PIL import Image
+from scipy.ndimage import distance_transform_edt
+import torch
+
+from gsedit.selection.whole_object_preview import projected_hits
+from utils.ply_semantic_utils import read_vertices
+
+
+def independent_groups(proposals, *, minimum_jaccard):
+    parent = list(range(len(proposals)))
+
+    def root(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for i, first in enumerate(proposals):
+        for j in range(i+1, len(proposals)):
+            second = proposals[j]
+            if first["view"] == second["view"]:
+                continue
+            shared = np.intersect1d(first["ids"], second["ids"],
+                                     assume_unique=True).size
+            union = len(first["ids"])+len(second["ids"])-shared
+            if union and shared/union >= minimum_jaccard:
+                parent[root(j)] = root(i)
+    groups = {}
+    for i in range(len(proposals)):
+        groups.setdefault(root(i), []).append(i)
+    return list(groups.values())
+
+
+def run(args):
+    output = Path(args.output_dir).resolve()
+    if output.exists():
+        raise FileExistsError(output)
+    started = time.perf_counter()
+    _, vertices = read_vertices(args.scene)
+    xyz = np.column_stack([vertices[k] for k in ("x", "y", "z")]).astype(np.float64)
+    scales = np.max(np.column_stack([vertices[f"scale_{j}"] for j in range(3)]), axis=1)
+    selected = np.unique(np.load(args.selected_indices, allow_pickle=False))
+    if not len(selected) or selected.min() < 0 or selected.max() >= len(xyz):
+        raise ValueError("Invalid target selection")
+    with open(args.cameras, encoding="utf-8") as handle:
+        cameras = {c["img_name"]: c for c in json.load(handle)}
+    with open(args.target_manifest, encoding="utf-8") as handle:
+        manifest = json.load(handle)["views"]
+    training = sorted(v for v, info in manifest.items() if info.get("accepted")
+                      and v in cameras and v not in args.holdout_views)
+    if len(training) < args.min_views:
+        raise ValueError("Too few target views for independent instance protection")
+    if args.device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+    if args.max_views and len(training) > args.max_views:
+        indices = np.linspace(0, len(training)-1, args.max_views).round().astype(int)
+        training = [training[i] for i in np.unique(indices)]
+    from ultralytics import SAM
+    segmenter = SAM(args.sam_model)
+    proposals = []
+    for view in training:
+        matches = [path for path in Path(args.images).glob(view+".*") if
+                   path.suffix.lower() in (".jpg", ".jpeg", ".png")]
+        if len(matches) != 1:
+            raise ValueError(f"Expected one image for {view}")
+        with Image.open(matches[0]) as source:
+            size = (args.image_width, round(source.height*args.image_width/source.width))
+            image = np.asarray(source.convert("RGB").resize(size))
+        target = np.asarray(Image.open(manifest[view]["mask_path"]).convert("L")
+                            .resize(size, Image.Resampling.NEAREST)) > 127
+        near = distance_transform_edt(~target) <= args.near_mask_px
+        result = segmenter.predict(source=image, imgsz=args.sam_size,
+                                   device=args.device, verbose=False)[0]
+        if result.masks is None:
+            continue
+        for index, tensor in enumerate(result.masks.data[:args.max_proposals_per_view]):
+            mask = tensor.cpu().numpy() > .5
+            if mask.shape != target.shape:
+                mask = np.asarray(Image.fromarray(mask).resize(size,
+                                  Image.Resampling.NEAREST)) > 0
+            area = mask.mean()
+            overlap = (mask & target).sum()/max(mask.sum(), 1)
+            if (not args.min_area <= area <= args.max_area or
+                    overlap > args.max_target_overlap or not (mask & near).any()):
+                continue
+            ids = np.flatnonzero(projected_hits(xyz, cameras[view], mask, scales,
+                depth_tolerance=args.depth_tolerance,
+                max_footprint_px=args.max_footprint_px))
+            if len(ids) >= args.min_instance_splats:
+                proposals.append({"view": view, "mask_index": index,
+                                  "ids": ids, "target_overlap": float(overlap)})
+    groups = independent_groups(proposals, minimum_jaccard=args.min_jaccard)
+    protected = np.zeros(len(xyz), dtype=bool)
+    labels = np.zeros(len(xyz), dtype=np.uint16)
+    instances = []
+    for members in groups:
+        views = sorted({proposals[i]["view"] for i in members})
+        if len(views) < args.min_views:
+            continue
+        votes = np.zeros(len(xyz), dtype=np.uint8)
+        for view in views:
+            ids = np.unique(np.concatenate([proposals[i]["ids"] for i in members
+                                            if proposals[i]["view"] == view]))
+            votes[ids] += 1
+        ids = np.flatnonzero(votes >= args.min_views)
+        if len(ids) < args.min_instance_splats:
+            continue
+        identity = len(instances)+1
+        protected[ids] = True
+        labels[ids[labels[ids] == 0]] = identity
+        instances.append({"instance_id": identity, "views": views,
+                          "source_gaussians": len(ids),
+                          "proposal_count": len(members)})
+    conflicts = selected[protected[selected]]
+    if len(conflicts)/len(selected) > args.max_selection_conflict:
+        raise ValueError(f"Independent instances conflict with {len(conflicts)} "
+                         "target Gaussians; refusing automatic removal")
+    if protected.mean() > args.max_protected_scene_fraction:
+        raise ValueError("Independent instance protection is implausibly broad")
+    output.mkdir(parents=True)
+    np.save(output / "protected-source-indices.npy", np.flatnonzero(protected))
+    np.save(output / "instance-ids.npy", labels)
+    np.save(output / "removal-conflicts.npy", conflicts)
+    report = {"instances": instances, "training_views": training,
+              "protected_source_gaussians": int(protected.sum()),
+              "removal_conflicts": len(conflicts),
+              "approved": False, "elapsed_seconds": time.perf_counter()-started,
+              "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024,
+              "peak_gpu_allocated_mb": (torch.cuda.max_memory_allocated()/1024**2
+                                        if args.device == "cuda" else None)}
+    with open(output / "report.json", "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2)
+        handle.write("\n")
+    return report
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    for name in ("scene", "selected-indices", "cameras", "images",
+                 "target-manifest", "output-dir"):
+        p.add_argument("--"+name, required=True)
+    p.add_argument("--holdout-views", nargs="+", required=True)
+    p.add_argument("--sam-model", default="mobile_sam.pt")
+    p.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    p.add_argument("--max-views", type=int, default=8)
+    p.add_argument("--min-views", type=int, default=2)
+    p.add_argument("--image-width", type=int, default=540)
+    p.add_argument("--sam-size", type=int, default=640)
+    p.add_argument("--max-proposals-per-view", type=int, default=80)
+    p.add_argument("--min-area", type=float, default=.003)
+    p.add_argument("--max-area", type=float, default=.7)
+    p.add_argument("--max-target-overlap", type=float, default=.25)
+    p.add_argument("--near-mask-px", type=float, default=32)
+    p.add_argument("--min-instance-splats", type=int, default=40)
+    p.add_argument("--depth-tolerance", type=float, default=.25)
+    p.add_argument("--max-footprint-px", type=float, default=10)
+    p.add_argument("--min-jaccard", type=float, default=.08)
+    p.add_argument("--max-selection-conflict", type=float, default=.05)
+    p.add_argument("--max-protected-scene-fraction", type=float, default=.5)
+    return p
+
+
+if __name__ == "__main__":
+    print(json.dumps(run(parser().parse_args()), indent=2))

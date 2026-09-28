@@ -36,7 +36,7 @@ original/pruned pair as the target box:
 
 ```bash
 conda activate gaussian-orin
-python add_asset.py \
+python -m gsedit.assets.add_asset \
   --prompt "red glass bottle" \
   --scene output/bottle-orin-128d-5k/semantic-validation/no-bottle-reconstructed-color-matched.ply \
   --plane-json output/bottle-orin-128d-5k/semantic-validation/carpet-fill-preview-distance-support/preview.json \
@@ -51,7 +51,7 @@ For the blue bottle using local SDXL instead of the Gemini API:
 
 ```bash
 conda activate gaussian-orin
-python add_asset.py \
+python -m gsedit.assets.add_asset \
   --image-provider local-sdxl \
   --image-python output/setup/sdxl-orin/bin/python \
   --local-model output/models/sdxl-base-1.0-fp16 \

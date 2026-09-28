@@ -6,6 +6,8 @@ recover unseen ground truth: it samples a nearby observed texture patch,
 places small Gaussians on the fitted plane, and copies carpet semantics.
 """
 
+from gsedit.runtime import PROJECT_ROOT, module_command
+
 import argparse
 import hashlib
 import json
@@ -681,12 +683,12 @@ def preview(args):
         metrics = {}
         for name in args.views:
             render_path = output_dir / f"{name}.png"
-            subprocess.run([sys.executable, str(Path(__file__).with_name("render_ply_preview.py")),
+            subprocess.run([*module_command("render_ply_preview.py"),
                             "--ply", str(candidate_path), "--cameras", str(cameras_path),
                             "--image-name", name, "--output", str(render_path),
                             "--width", str(args.render_width)], check=True)
             if refinement:
-                subprocess.run([sys.executable, str(Path(__file__).with_name("render_ply_preview.py")),
+                subprocess.run([*module_command("render_ply_preview.py"),
                                 "--ply", str(output_dir / "refined-pruned.ply"),
                                 "--cameras", str(cameras_path), "--image-name", name,
                                 "--output", str(output_dir / f"{name}-pruned.png"),

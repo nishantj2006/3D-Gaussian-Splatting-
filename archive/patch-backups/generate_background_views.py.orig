@@ -1,0 +1,266 @@
+"""Generate masked backgrounds, then fuse their appearance onto new 3D Gaussians.
+
+The input PLY already contains wall/floor replacement geometry. A small set of
+training photos is inpainted and projected onto that *one* geometry, so saved
+texture is shared across camera views. This is an unapproved preview, never a
+mutation of the source. OpenCV is a cheap diagnostic backend; diffusion is the
+actual learned image-generation backend.
+"""
+
+import argparse
+import json
+from pathlib import Path
+import resource
+import time
+
+import cv2
+import numpy as np
+from PIL import Image
+
+from multiview_instance import project
+from utils.ply_semantic_utils import read_vertices, write_vertices
+
+
+SH_C0 = 0.28209479177387814
+SAFE_WALL_INLIER_RATIO = .3
+SAFE_WALL_COLOR_DISTANCE = 1.5
+SAFE_FLOOR_DONOR_DISTANCE = 1.5
+
+
+def image_size(camera, width):
+    height = round(width * camera["height"] / camera["width"] / 8) * 8
+    return width, height
+
+
+def projected_membership(xyz, camera, mask):
+    x, y, _, valid = project(xyz, camera, mask.shape)
+    ids = np.flatnonzero(valid)
+    inside = np.zeros(len(xyz), dtype=bool)
+    inside[ids] = mask[y[ids], x[ids]]
+    return x, y, inside
+
+
+def choose_views(footprints, max_views):
+    """Greedy set cover of new Gaussians, deterministic on tied view names."""
+    remaining = np.ones(len(next(iter(footprints.values()))), dtype=bool)
+    chosen = []
+    for _ in range(min(max_views, len(footprints))):
+        available = sorted(set(footprints) - set(chosen))
+        view = max(available, key=lambda name: (int((footprints[name] & remaining).sum()),
+                                                -available.index(name)))
+        new_count = int((footprints[view] & remaining).sum())
+        if not new_count:
+            break
+        chosen.append(view)
+        remaining &= ~footprints[view]
+    return chosen, float(1 - remaining.mean())
+
+
+def fuse_colors(base_rgb, observations, max_disagreement):
+    """Robust color consensus; keep donor color where generated views lack coverage."""
+    sums = np.zeros_like(base_rgb, dtype=np.float64)
+    squares = np.zeros_like(base_rgb, dtype=np.float64)
+    counts = np.zeros(len(base_rgb), dtype=np.int32)
+    for ids, colors in observations:
+        sums[ids] += colors
+        squares[ids] += colors**2
+        counts[ids] += 1
+    result = base_rgb.copy()
+    observed = counts > 0
+    result[observed] = sums[observed] / counts[observed, None]
+    multi = counts >= 2
+    if multi.any():
+        variance = np.maximum(squares[multi] / counts[multi, None] -
+                              result[multi]**2, 0)
+        disagreement = float(np.quantile(np.sqrt(variance.mean(axis=1)), .9))
+    else:
+        disagreement = None
+    consistent = disagreement is not None and disagreement <= max_disagreement
+    return result, counts, disagreement, consistent
+
+
+def load_photo(images, view, size):
+    paths = sorted(Path(images).glob(view + ".*"))
+    if len(paths) != 1:
+        raise ValueError(f"Expected exactly one source photo for {view}: {paths}")
+    return np.asarray(Image.open(paths[0]).convert("RGB").resize(size), dtype=np.uint8)
+
+
+def load_mask(path, size):
+    return np.asarray(Image.open(path).convert("L").resize(
+        size, Image.Resampling.NEAREST)) > 127
+
+
+def inpaint_opencv(photo, mask, radius):
+    expanded = cv2.dilate(mask.astype(np.uint8), np.ones((radius, radius), np.uint8))
+    painted = cv2.inpaint(photo, expanded, radius, cv2.INPAINT_TELEA)
+    painted[~mask] = photo[~mask]
+    return painted
+
+
+def load_diffusion(model):
+    try:
+        import torch
+        from diffusers import AutoPipelineForInpainting
+    except ImportError as exc:
+        raise RuntimeError("Diffusion backend needs diffusers and accelerate in the "
+                           "selected conda environment") from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError("Diffusion inpainting requires CUDA")
+    pipe = AutoPipelineForInpainting.from_pretrained(
+        model, torch_dtype=torch.float16, variant="fp16", use_safetensors=True)
+    if hasattr(pipe, "enable_model_cpu_offload"):
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe.to("cuda")
+    return pipe
+
+
+def inpaint_diffusion(pipe, photo, mask, prompt, negative_prompt, steps, seed,
+                      strength=1.0):
+    import torch
+    rng = torch.Generator(device="cuda").manual_seed(seed)
+    with torch.inference_mode():
+        result = pipe(prompt=prompt, negative_prompt=negative_prompt,
+                      image=Image.fromarray(photo),
+                      mask_image=Image.fromarray((mask * 255).astype(np.uint8)),
+                      height=photo.shape[0], width=photo.shape[1],
+                      num_inference_steps=steps, guidance_scale=7.5,
+                      generator=rng).images[0]
+    painted = np.asarray(result.convert("RGB"), dtype=np.uint8).copy()
+    painted[~mask] = photo[~mask]
+    return painted
+
+
+def run(args):
+    output = Path(args.output_dir).resolve()
+    if output.exists():
+        raise FileExistsError(f"Refusing to reuse output directory: {output}")
+    if args.width < 256 or args.width % 8 or args.max_views < 1:
+        raise ValueError("Width must be >=256 and divisible by 8; max views >=1")
+    started = time.perf_counter()
+    template, vertices = read_vertices(args.seed)
+    with open(args.seed_report, encoding="utf-8") as handle:
+        report = json.load(handle)
+    original_count = int(report["original_kept"])
+    if not 0 < original_count < len(vertices):
+        raise ValueError("Invalid seed Gaussian boundary")
+    with open(args.wall_fit, encoding="utf-8") as handle:
+        fit = json.load(handle)
+    if (fit["inlier_ratio"] < args.min_wall_inlier_ratio or
+            fit["plane_error_q90"] > args.max_wall_error):
+        raise ValueError("Wall fit is too uncertain for generated 3D texture")
+    with open(args.cameras, encoding="utf-8") as handle:
+        cameras = {c["img_name"]: c for c in json.load(handle)}
+    with open(args.bed_manifest, encoding="utf-8") as handle:
+        masks = json.load(handle)["views"]
+    frame_masks = {}
+    if args.frame_manifest:
+        with open(args.frame_manifest, encoding="utf-8") as handle:
+            frame_masks = json.load(handle)["views"]
+    xyz = np.column_stack([vertices[k][original_count:] for k in ("x", "y", "z")])
+    candidate_views = sorted(v for v, info in masks.items() if info.get("accepted")
+                             and v in cameras and v not in args.holdout_views)
+    if len(candidate_views) < 2:
+        raise ValueError("Need at least two non-held-out masked views")
+    footprints, inputs = {}, {}
+    for view in candidate_views:
+        size = image_size(cameras[view], args.width)
+        bed = load_mask(masks[view]["mask_path"], size)
+        frame_info = frame_masks.get(view, {})
+        if frame_info.get("accepted"):
+            bed &= ~load_mask(frame_info["mask_path"], size)
+        if not bed.any() or bed.mean() > args.max_mask_fraction:
+            continue
+        x, y, inside = projected_membership(xyz, cameras[view], bed)
+        footprints[view] = inside
+        inputs[view] = (size, bed, x, y)
+    if len(footprints) < 2:
+        raise ValueError("Too few safe views after frame/mask filtering")
+    views, geometric_coverage = choose_views(footprints, args.max_views)
+    if len(views) < 2 or geometric_coverage < args.min_coverage:
+        raise ValueError(f"Generated views cover only {geometric_coverage:.1%} of new geometry")
+    output.mkdir(parents=True)
+    pipe = load_diffusion(args.model) if args.backend == "diffusion" else None
+    observations = []
+    for number, view in enumerate(views):
+        size, mask, x, y = inputs[view]
+        photo = load_photo(args.images, view, size)
+        if args.backend == "diffusion":
+            generated = inpaint_diffusion(pipe, photo, mask, args.prompt,
+                                          args.negative_prompt, args.steps,
+                                          args.random_seed + number)
+        else:
+            generated = inpaint_opencv(photo, mask, args.opencv_radius)
+        Image.fromarray(generated).save(output / f"{view}-generated.png")
+        Image.fromarray((mask * 255).astype(np.uint8)).save(output / f"{view}-mask.png")
+        ids = np.flatnonzero(footprints[view])
+        observations.append((ids, generated[y[ids], x[ids]].astype(np.float64)/255))
+    base_rgb = np.clip(np.column_stack([
+        vertices[f"f_dc_{j}"][original_count:] for j in range(3)])*SH_C0+.5, 0, 1)
+    colors, counts, disagreement, consistent = fuse_colors(
+        base_rgb, observations, args.max_disagreement)
+    painted = vertices.copy()
+    observed = counts > 0
+    for channel in range(3):
+        field = painted[f"f_dc_{channel}"][original_count:]
+        field[observed] = (colors[observed, channel]-.5)/SH_C0
+    for field_name in vertices.dtype.names:
+        if field_name.startswith("f_rest_"):
+            painted[field_name][original_count:][observed] = 0
+    candidate = output / "candidate.ply"
+    write_vertices(candidate, painted, template,
+                   ["UNAPPROVED generated background texture on fixed wall/floor geometry"])
+    coverage = float(observed.mean())
+    geometry_safe = (fit["inlier_ratio"] >= SAFE_WALL_INLIER_RATIO and
+                     report.get("wall_color_distance_q90", float("inf")) <=
+                     SAFE_WALL_COLOR_DISTANCE and
+                     report.get("floor_donor_distance_q90", float("inf")) <=
+                     SAFE_FLOOR_DONOR_DISTANCE)
+    result = {"seed": str(Path(args.seed).resolve()), "candidate": str(candidate),
+              "wall_fit_inlier_ratio": fit["inlier_ratio"],
+              "backend": args.backend, "model": args.model if pipe else None,
+              "surface_evidence_safe": bool(geometry_safe),
+              "generated_views": views, "holdout_views": args.holdout_views,
+              "added_gaussians": len(xyz), "textured_gaussians": int(observed.sum()),
+              "coverage": coverage, "geometric_coverage": geometric_coverage,
+              "multi_view_gaussians": int((counts >= 2).sum()),
+              "color_disagreement_q90": disagreement,
+              "automatic_checks_pass": bool(coverage >= args.min_coverage and
+                                            consistent and geometry_safe),
+              "approved": False,
+              "warning": "Generated appearance is hypothetical; held-out RGB review is still required.",
+              "elapsed_seconds": time.perf_counter()-started,
+              "peak_rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1024}
+    with open(output / "report.json", "w", encoding="utf-8") as handle:
+        json.dump(result, handle, indent=2)
+        handle.write("\n")
+    return result
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    for name in ("seed", "seed-report", "wall-fit", "cameras", "bed-manifest",
+                 "images", "output-dir"):
+        p.add_argument("--"+name, required=True)
+    p.add_argument("--frame-manifest")
+    p.add_argument("--holdout-views", nargs="+", required=True)
+    p.add_argument("--backend", choices=("diffusion", "opencv"), default="diffusion")
+    p.add_argument("--model", default="diffusers/stable-diffusion-xl-1.0-inpainting-0.1")
+    p.add_argument("--prompt", default="An empty room with a plain continuous wall and carpet floor, realistic indoor photograph, matching the surrounding lighting and texture")
+    p.add_argument("--negative-prompt", default="bed, mattress, bedding, blanket, furniture, floating objects, painted rectangle, hole, seam, text")
+    p.add_argument("--steps", type=int, default=30)
+    p.add_argument("--random-seed", type=int, default=0)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--max-views", type=int, default=4)
+    p.add_argument("--opencv-radius", type=int, default=7)
+    p.add_argument("--max-mask-fraction", type=float, default=.65)
+    p.add_argument("--min-coverage", type=float, default=.75)
+    p.add_argument("--max-disagreement", type=float, default=.16)
+    p.add_argument("--min-wall-inlier-ratio", type=float, default=SAFE_WALL_INLIER_RATIO)
+    p.add_argument("--max-wall-error", type=float, default=.3)
+    return p
+
+
+if __name__ == "__main__":
+    print(json.dumps(run(parser().parse_args()), indent=2))

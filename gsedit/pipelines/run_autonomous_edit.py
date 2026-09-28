@@ -1,0 +1,269 @@
+"""Text-targeted, reversible object removal and generated planar repair.
+
+The source and earlier previews are never changed. A new folder contains each
+stage's evidence. Poor object masks or surface fits stop before generation.
+"""
+
+from gsedit.runtime import PROJECT_ROOT, module_command
+
+import argparse
+import json
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+import numpy as np
+
+from gsedit.pipelines.run_generated_background import cli_options, masked_metrics
+from utils.ply_semantic_utils import read_vertices
+
+
+ROOT = PROJECT_ROOT
+
+
+def diverse_holdouts(cameras, manifest, count=3):
+    available = sorted(v for v, entry in manifest["views"].items() if
+                       entry.get("accepted") and v in cameras)
+    if len(available) < count+4:
+        raise ValueError("Too few accepted target views for a held-out evaluation")
+    positions = {v: np.asarray(cameras[v]["position"], float) for v in available}
+    center = np.median(np.stack(list(positions.values())), axis=0)
+    selected = [min(available, key=lambda v: np.linalg.norm(positions[v]-center))]
+    while len(selected) < count:
+        left = [v for v in available if v not in selected]
+        selected.append(max(left, key=lambda v: (min(np.linalg.norm(
+            positions[v]-positions[s]) for s in selected), v)))
+    return selected
+
+
+def stage(script, values, report, label):
+    began = time.perf_counter()
+    command = [*module_command(script, python=sys.executable)] + cli_options(values)
+    log = Path(report["output"])/(label + ".log")
+    with open(log, "w", encoding="utf-8") as stream:
+        result = subprocess.run(command, cwd=ROOT, stdout=stream,
+                                stderr=subprocess.STDOUT, check=False)
+    elapsed = time.perf_counter()-began
+    out = Path(values["output_dir"])
+    details = None
+    for file in ("report.json", "preview.json", "manifest.json", "summary.json"):
+        if (out/file).exists():
+            with open(out/file, encoding="utf-8") as handle:
+                details = json.load(handle)
+            break
+    report["stages"][label] = {"seconds": elapsed, "output": str(out),
+                               "log": str(log), "exit_code": result.returncode,
+                               "details": details}
+    if result.returncode:
+        tail = log.read_text(encoding="utf-8", errors="replace").splitlines()[-5:]
+        raise RuntimeError(f"{label} failed: {' | '.join(tail)}; see {log}")
+    return out
+
+
+def reconcile_selection(selected_path, protected_path, destination,
+                        *, max_conflict_fraction=.05):
+    selected = np.unique(np.load(selected_path, allow_pickle=False))
+    protected = np.unique(np.load(protected_path, allow_pickle=False))
+    conflicts = np.intersect1d(selected, protected, assume_unique=True)
+    if len(conflicts)/max(len(selected), 1) > max_conflict_fraction:
+        raise ValueError("Neighbor protection conflicts with target selection")
+    safe = np.setdiff1d(selected, protected, assume_unique=True)
+    if not len(safe):
+        raise ValueError("No target splats remain after protection")
+    np.save(destination, safe)
+    return {"selected": len(safe), "protected_conflicts": len(conflicts)}
+
+
+def run(args):
+    output = Path(args.output_dir).resolve()
+    if output.exists():
+        raise FileExistsError(output)
+    source = Path(args.scene).resolve()
+    images = Path(args.images).resolve()
+    cameras_path = Path(args.cameras).resolve()
+    pca = Path(args.pca_path).resolve()
+    for path in (source, images, cameras_path, pca):
+        if not path.exists():
+            raise FileNotFoundError(path)
+    _, vertices = read_vertices(source)
+    if sum(name.startswith("semantic_") for name in vertices.dtype.names) != 128:
+        raise ValueError("This workflow requires the trained 128D scene PLY")
+    with open(cameras_path, encoding="utf-8") as handle:
+        cameras = {v["img_name"]: v for v in json.load(handle)}
+    output.mkdir(parents=True)
+    started = time.perf_counter()
+    report = {"source": str(source), "target": args.text, "output": str(output), "approved": False,
+              "status": "running", "stages": {}}
+    holdouts = args.holdout_views
+    try:
+        preview = stage("auto_remove_preview.py", dict(
+            scene=str(source), text=args.text, cameras=str(cameras_path),
+            images=str(images), pca_path=str(pca), sam_model=args.sam_model,
+            exclude_views=args.holdout_views or [],
+            device=args.device, output_dir=str(output/"text-selection")), report,
+            "text_selection")
+        seeds = preview/"image-seeds"/"selected-indices.npy"
+        baseline = preview/"appearance-expanded"/"selected-indices.npy"
+        masks = stage("grounded_sam2_masks.py", dict(
+            scene=str(source), seed_indices=str(seeds), cameras=str(cameras_path),
+            images=str(images), prompts=[args.text], device=args.mask_device,
+            output_dir=str(output/"target-masks")), report, "target_masks")
+        with open(masks/"manifest.json", encoding="utf-8") as handle:
+            mask_report = json.load(handle)
+        if not holdouts:
+            holdouts = diverse_holdouts(cameras, mask_report)
+        elif any(v not in mask_report["views"] or not
+                 mask_report["views"][v].get("accepted") for v in holdouts):
+            raise ValueError("Requested holdout lacks an accepted target mask")
+        report["holdout_views"] = holdouts
+        with open(preview/"summary.json", encoding="utf-8") as handle:
+            seed_views = json.load(handle)["automatic_views"]
+        report["holdout_seed_overlap"] = sorted(set(seed_views) & set(holdouts))
+        if report["holdout_seed_overlap"]:
+            report["warning"] = "Holdouts informed the initial seed; visual metrics are diagnostic only."
+        lifted = stage("lift_grounded_masks.py", dict(
+            scene=str(source), seed_indices=str(seeds), baseline_indices=str(baseline),
+            mask_manifest=str(masks/"manifest.json"), cameras=str(cameras_path),
+            images=str(images), holdout_views=holdouts,
+            output_dir=str(output/"multi-view-selection")), report, "multiview_selection")
+        initial = lifted/"graph-indices.npy"
+        neighbors = stage("protect_neighbor_instances.py", dict(
+            scene=str(source), selected_indices=str(initial), cameras=str(cameras_path),
+            images=str(images), target_manifest=str(masks/"manifest.json"),
+            holdout_views=holdouts, sam_model=args.sam_model, device=args.mask_device,
+            output_dir=str(output/"protected-instances")), report, "neighbor_instances")
+        selected_path = output/"safe-selected-indices.npy"
+        report["selection"] = reconcile_selection(
+            initial, neighbors/"protected-source-indices.npy", selected_path)
+        pruned = stage("materialize_selection_preview.py", dict(
+            scene=str(source), indices=str(selected_path),
+            output_dir=str(output/"pruned")), report, "first_removal")
+        revealed = stage("attribute_revealed_bed.py", dict(
+            source=str(source), seed=str(pruned/"pruned-preview.ply"),
+            selected_indices=str(selected_path), cameras=str(cameras_path),
+            mask_manifest=str(masks/"manifest.json"), holdout_views=holdouts,
+            protected_source_indices=str(neighbors/"protected-source-indices.npy")
+                if np.load(neighbors/"protected-source-indices.npy").size else None,
+            output_dir=str(output/"revealed-layers")), report, "revealed_layers")
+        wall_masks = stage("grounded_surface_masks.py", dict(
+            images=str(images), foreground_manifest=str(masks/"manifest.json"),
+            prompts=["wall"], device=args.mask_device,
+            output_dir=str(output/"wall-masks")), report, "wall_masks")
+        floor_masks = stage("grounded_surface_masks.py", dict(
+            images=str(images), foreground_manifest=str(masks/"manifest.json"),
+            prompts=["floor", "carpet"], device=args.mask_device,
+            output_dir=str(output/"floor-masks")), report, "floor_masks")
+        floor = stage("fit_floor_from_masks.py", dict(
+            scene=str(source), selected_indices=str(selected_path),
+            cameras=str(cameras_path), floor_manifest=str(floor_masks/"manifest.json"),
+            holdout_views=holdouts, output_dir=str(output/"floor-fit")), report,
+            "floor_fit")
+        wall = stage("fit_depth_wall.py", dict(
+            scene=str(pruned/"pruned-preview.ply"), floor_plane=str(floor/"preview.json"),
+            wall_manifest=str(wall_masks/"manifest.json"),
+            cameras=str(cameras_path), images=str(images),
+            holdout_views=holdouts, min_inlier_ratio=args.min_wall_inlier_ratio,
+            output_dir=str(output/"wall-fit")), report, "wall_fit")
+        validation = stage("validate_surface_fit.py", dict(
+            scene=str(pruned/"pruned-preview.ply"), wall_fit=str(wall/"report.json"),
+            wall_manifest=str(wall_masks/"manifest.json"),
+            cameras=str(cameras_path), holdout_views=holdouts,
+            output_dir=str(output/"surface-validation")), report,
+            "surface_validation")
+        with open(validation/"report.json", encoding="utf-8") as handle:
+            surface_checks = json.load(handle)
+        if not surface_checks["geometry_supported"]:
+            raise ValueError("Held-out wall depth does not support 3D replacement")
+        fill = stage("build_continuous_background.py", dict(
+            source=str(source), base=str(revealed/"candidate.ply"),
+            selected_indices=str(selected_path),
+            gate_evidence=str(revealed/"evidence.npz"),
+            wall_fit=str(wall/"report.json"), floor_fit=str(floor/"preview.json"),
+            wall_photo_samples=str(wall/"wall-photo-samples.npz"),
+            bed_manifest=str(masks/"manifest.json"),
+            wall_manifest=str(wall_masks/"manifest.json"),
+            cameras=str(cameras_path), holdout_views=holdouts,
+            old_floor_count=0, output_dir=str(output/"surface-fill")),
+            report, "surface_fill")
+        atlas = stage("generate_surface_atlas.py", dict(
+            source_scene=str(source), seed=str(fill/"candidate.ply"),
+            seed_report=str(fill/"report.json"), wall_fit=str(wall/"report.json"),
+            floor_fit=str(floor/"preview.json"), cameras=str(cameras_path),
+            images=str(images), target_manifest=str(masks/"manifest.json"),
+            wall_manifest=str(wall_masks/"manifest.json"),
+            floor_manifest=str(floor_masks/"manifest.json"),
+            holdout_views=holdouts, backend=args.backend, model=args.model,
+            steps=args.steps, random_seed=args.random_seed,
+            output_dir=str(output/"generated-atlas")), report, "generated_atlas")
+        candidate = atlas/"candidate.ply"
+        if not args.skip_optimization:
+            optimized = stage("optimize_continuous_background.py", dict(
+                seed=str(candidate), seed_report=str(fill/"report.json"),
+                gate_evidence=str(revealed/"evidence.npz"),
+                cameras=str(cameras_path), bed_manifest=str(masks/"manifest.json"),
+                wall_manifest=str(wall_masks/"manifest.json"), images=str(images),
+                holdout_views=holdouts, output_dir=str(output/"optimized")),
+                report, "local_optimization")
+            candidate = optimized/"candidate.ply"
+        diagnostics = output/"heldout-renders"
+        diagnostics.mkdir()
+        metrics = {}
+        for view in holdouts:
+            before = diagnostics/f"{view}-removed.png"
+            after = diagnostics/f"{view}-generated.png"
+            for ply, image in ((revealed/"candidate.ply", before), (candidate, after)):
+                command = [*module_command("render_ply_preview.py", python=sys.executable),
+                           "--ply", str(ply), "--cameras", str(cameras_path),
+                           "--image-name", view, "--output", str(image)]
+                subprocess.run(command, cwd=ROOT, check=True)
+            metrics[view] = masked_metrics(before, after,
+                mask_report["views"][view]["mask_path"])
+        report["stages"]["heldout"] = metrics
+        overhead = {}
+        for name, ply in (("removed", revealed/"candidate.ply"),
+                          ("generated", candidate)):
+            path = diagnostics/f"overhead-{name}.png"
+            command = [*module_command("render_overhead_preview.py", python=sys.executable),
+                       "--ply", str(ply), "--source", str(source),
+                       "--selected-indices", str(selected_path),
+                       "--floor-fit", str(wall/"report.json"),
+                       "--cameras", str(cameras_path),
+                       "--reference-view", holdouts[0], "--output", str(path)]
+            subprocess.run(command, cwd=ROOT, check=True)
+            overhead[name] = str(path)
+        report["stages"]["overhead"] = overhead
+        report["candidate"] = str(candidate)
+        report["status"] = "needs_visual_review"
+    except Exception as exc:
+        report["status"] = "unsupported_or_failed"
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        report["elapsed_seconds"] = time.perf_counter()-started
+        with open(output/"workflow-report.json", "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2)
+            handle.write("\n")
+    return report
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    for name in ("scene", "images", "cameras", "text", "pca-path", "output-dir"):
+        p.add_argument("--"+name, required=True)
+    p.add_argument("--holdout-views", nargs="+")
+    p.add_argument("--sam-model", default="mobile_sam.pt")
+    p.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    p.add_argument("--mask-device", choices=("cpu", "cuda"), default="cuda")
+    p.add_argument("--backend", choices=("diffusion", "opencv"), default="diffusion")
+    p.add_argument("--model", default="diffusers/stable-diffusion-xl-1.0-inpainting-0.1")
+    p.add_argument("--steps", type=int, default=30)
+    p.add_argument("--random-seed", type=int, default=0)
+    p.add_argument("--min-wall-inlier-ratio", type=float, default=.3)
+    p.add_argument("--skip-optimization", action="store_true")
+    return p
+
+
+if __name__ == "__main__":
+    options = parser().parse_args()
+    print(json.dumps(run(options), indent=2))

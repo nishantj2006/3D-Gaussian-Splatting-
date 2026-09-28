@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gaussian-scene-editing"
+version = "0.1.0"
+description = "Reversible semantic Gaussian scene editing on Jetson Orin"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["gsedit*", "arguments*", "scene*", "utils*", "models*", "gaussian_renderer*", "lpipsPyTorch*"]
+
+[tool.setuptools.package-data]
+gsedit = ["commands.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

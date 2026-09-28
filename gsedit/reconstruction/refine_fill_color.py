@@ -5,6 +5,8 @@ opacity, and semantic features stay byte-identical. The source preview is
 never overwritten, and the result still requires visual approval.
 """
 
+from gsedit.runtime import PROJECT_ROOT, module_command
+
 import argparse
 import json
 import shutil
@@ -16,7 +18,7 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-from reconstruct_flat import sha256
+from gsedit.reconstruction.reconstruct_flat import sha256
 from utils.ply_semantic_utils import read_vertices, write_vertices
 
 
@@ -169,9 +171,9 @@ def main():
     Image.fromarray((mask * 255).astype(np.uint8)).save(destination / "fill-mask.png")
     shutil.copy2(args.reference_render, destination / "reference-before.png")
     shutil.copy2(args.camera_json, destination / "diagnostic-cameras.json")
-    tool = Path(__file__).with_name("render_ply_preview.py")
+    tool = module_command("render_ply_preview.py")
     def render(cameras, name, output, width):
-        subprocess.run([sys.executable, str(tool), "--ply", str(output_ply),
+        subprocess.run([*tool, "--ply", str(output_ply),
                         "--cameras", str(cameras), "--image-name", name,
                         "--output", str(output), "--width", str(width)], check=True)
     render(destination / "diagnostic-cameras.json", args.image_name,
