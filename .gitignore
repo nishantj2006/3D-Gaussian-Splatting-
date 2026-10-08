@@ -17,3 +17,7 @@ data_scannet
 *.bin
 *.pt
 *.pth
+external_tools/
+*.rej
+*.orig
+archive/

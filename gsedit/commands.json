@@ -80,5 +80,9 @@
   "recover_background_evidence": "gsedit.reconstruction.recover_background_evidence",
   "refine_fill_color": "gsedit.reconstruction.refine_fill_color",
   "refine_local_background": "gsedit.reconstruction.refine_local_background",
-  "wall_color_field": "gsedit.reconstruction.wall_color_field"
+  "wall_color_field": "gsedit.reconstruction.wall_color_field",
+  "benchmark_gaussiancut": "gsedit.selection.benchmark_gaussiancut",
+  "compare_gaussiancut": "gsedit.evaluation.compare_gaussiancut",
+  "guard_graphcut_additions": "gsedit.selection.guard_graphcut_additions",
+  "collect_intact_cut_evidence": "gsedit.selection.collect_intact_cut_evidence"
 }

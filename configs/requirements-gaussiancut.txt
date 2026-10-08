@@ -1,0 +1,3 @@
+# Optional official GaussianCut CPU graph solver, tested on Orin/aarch64.
+# Install into gaussian-orin with --no-deps to preserve Jetson PyTorch/NumPy.
+PyMaxflow==1.3.2
